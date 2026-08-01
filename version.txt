@@ -1,9 +1,0 @@
-version=1.0.6
-rbz_url=https://raw.githubusercontent.com/PnToan/MN_plastic/main/mn_plastic.rbz
-
-
-
-
-
-
-
