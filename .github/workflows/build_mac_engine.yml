@@ -1,0 +1,62 @@
+name: Build macOS Nesting Engine
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Locate and Build Universal Binary
+        run: |
+          set -e
+          # Tự động tìm thư mục chứa mã nguồn Rust Cargo.toml
+          if [ -f "Cargo.toml" ]; then
+            ENGINE_DIR="."
+          elif [ -f "rust_engine/Cargo.toml" ]; then
+            ENGINE_DIR="rust_engine"
+          elif [ -f "data/engine/rust_engine/Cargo.toml" ]; then
+            ENGINE_DIR="data/engine/rust_engine"
+          else
+            FOUND=$(find . -name "Cargo.toml" -not -path "*/target/*" | head -n 1)
+            if [ -z "$FOUND" ]; then
+              echo "LỖI: Không tìm thấy file Cargo.toml trong repository!"
+              exit 1
+            fi
+            ENGINE_DIR=$(dirname "$FOUND")
+          fi
+
+          echo "==> Đang build tại thư mục: $ENGINE_DIR"
+          cd "$ENGINE_DIR"
+
+          echo "==> [1/3] Build Apple Silicon (aarch64)..."
+          cargo build --release --target aarch64-apple-darwin
+
+          echo "==> [2/3] Build Intel Mac (x86_64)..."
+          cargo build --release --target x86_64-apple-darwin
+
+          echo "==> [3/3] Tạo Universal Binary bằng lipo..."
+          lipo -create \
+            target/aarch64-apple-darwin/release/mn_nesting_engine \
+            target/x86_64-apple-darwin/release/mn_nesting_engine \
+            -output mn_nesting_engine
+
+          chmod +x mn_nesting_engine
+          echo "==> Build thành công:"
+          file mn_nesting_engine
+
+      - name: Upload macOS Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mn_nesting_engine-macos
+          path: "**/mn_nesting_engine"
+          if-no-files-found: error
