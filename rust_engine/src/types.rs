@@ -64,6 +64,12 @@ pub struct ClusterChild {
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw_layers: Option<Vec<DrawLayerData>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_grain_label: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain_arrow_degrees: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_rotation_degrees: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

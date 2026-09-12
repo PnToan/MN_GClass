@@ -31,6 +31,11 @@ pub fn find_best_mating(
     let max_bw = (board_w - margin * 2.0).max(100.0);
     let max_bh = (board_h - margin * 2.0).max(100.0);
     let global_grain_locked = config.and_then(|c| c.rotation_divisions).map_or(true, |d| d <= 2);
+    let is_grain_locked = global_grain_locked
+        || part_a.grain_locked == Some(true)
+        || part_b.grain_locked == Some(true)
+        || part_a.has_grain_label == Some(true)
+        || part_b.has_grain_label == Some(true);
 
     let poly_a = Polygon::from_raw(&part_a.contour);
     let poly_b = Polygon::from_raw(&part_b.contour);
@@ -89,6 +94,18 @@ pub fn find_best_mating(
             let is_0 = deg <= 2.0 || deg >= 358.0;
             if !is_180 && !is_0 {
                 continue;
+            }
+
+            let grain_a = part_a.has_grain_label == Some(true) || part_a.grain_locked == Some(true);
+            let grain_b = part_b.has_grain_label == Some(true) || part_b.grain_locked == Some(true);
+            if grain_a && grain_b && is_grain_locked {
+                let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
+                let base_b = part_b.base_rotation_degrees.or(part_b.rotation_degrees).unwrap_or(0.0);
+                let diff = (crate::packing::norm_angle(base_a + deg) - crate::packing::norm_angle(base_b)).abs() % 180.0;
+                let grain_aligned = diff <= 2.0 || diff >= 178.0;
+                if !grain_aligned {
+                    continue;
+                }
             }
 
             let cos_r = rot_angle.cos();
@@ -185,22 +202,28 @@ pub fn find_best_mating(
 
                 let w = comb_max_x - comb_min_x;
                 let h = comb_max_y - comb_min_y;
-                let vw = w.min(h);
-                let vh = w.max(h);
-                let macro_w = vw;
-                let macro_h = vh;
 
-                // Step 3.18 & 4.5: Sheet boundary guard
-                if macro_w > max_bw.min(max_bh) || macro_h > max_bw.max(max_bh) {
-                    continue;
-                }
-                if part_a.grain_locked == Some(true) || global_grain_locked {
-                    if macro_w > max_bw || macro_h > max_bh {
+                // Sheet boundary guard
+                if is_grain_locked {
+                    let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
+                    let m_base = crate::packing::norm_angle(base_a);
+                    let (sheet_dim_w, sheet_dim_h) = if (m_base.round() as i64).abs() % 180 == 90 {
+                        (h, w)
+                    } else {
+                        (w, h)
+                    };
+                    if sheet_dim_w > max_bw || sheet_dim_h > max_bh {
+                        continue;
+                    }
+                } else {
+                    let vw = w.min(h);
+                    let vh = w.max(h);
+                    if vw > max_bw.min(max_bh) || vh > max_bw.max(max_bh) {
                         continue;
                     }
                 }
 
-                let box_area = vw * vh;
+                let box_area = w * h;
                 if box_area <= 1.0 {
                     continue;
                 }
@@ -210,7 +233,7 @@ pub fn find_best_mating(
                     continue;
                 }
 
-                let score = fill_rate * 1000.0 - vw * 0.1 - box_area * 0.0005;
+                let score = fill_rate * 1000.0 - w.min(h) * 0.1 - box_area * 0.0005;
                 if score > best_score {
                     best_score = score;
                     best_candidate = Some((
@@ -252,37 +275,29 @@ pub fn find_best_mating(
     let kx = target_x0 + shift_x - (origin_bx * cos_r - origin_by * sin_r);
     let ky = target_y0 + shift_y - (origin_bx * sin_r + origin_by * cos_r);
 
-    let mut child_rot_a: f64 = 0.0;
-    let mut child_ox_a: f64 = -comb_min_x;
-    let mut child_oy_a: f64 = -comb_min_y;
+    let child_rot_a: f64 = 0.0;
+    let child_ox_a: f64 = -comb_min_x;
+    let child_oy_a: f64 = -comb_min_y;
 
-    let mut child_rot_b: f64 = (rot_angle * 180.0 / PI).rem_euclid(360.0);
-    let mut child_ox_b: f64 = kx - comb_min_x;
-    let mut child_oy_b: f64 = ky - comb_min_y;
+    let child_rot_b: f64 = (rot_angle * 180.0 / PI).rem_euclid(360.0);
+    let child_ox_b: f64 = kx - comb_min_x;
+    let child_oy_b: f64 = ky - comb_min_y;
 
-    let (macro_w, macro_h) = if w > h {
-        // Rotate combined assembly by +90 deg so macro is vertical: macro_w <= macro_h
-        let m_w = h;
-        let m_h = w;
+    let (macro_w, macro_h) = (w, h);
 
-        let new_rot_a = (child_rot_a + 90.0_f64).rem_euclid(360.0_f64);
-        let new_ox_a = h - child_oy_a;
-        let new_oy_a = child_ox_a;
-        child_rot_a = new_rot_a;
-        child_ox_a = new_ox_a;
-        child_oy_a = new_oy_a;
+    // Strict SAT collision verification between children in final assembly coordinates
+    let origin_zero = Point::new(0.0, 0.0);
+    let poly_a_final = poly_orig_ccw_a
+        .rotate_degrees(child_rot_a, origin_zero)
+        .translate(child_ox_a, child_oy_a);
+    let poly_b_final = poly_orig_ccw_b
+        .rotate_degrees(child_rot_b, origin_zero)
+        .translate(child_ox_b, child_oy_b);
 
-        let new_rot_b = (child_rot_b + 90.0_f64).rem_euclid(360.0_f64);
-        let new_ox_b = h - child_oy_b;
-        let new_oy_b = child_ox_b;
-        child_rot_b = new_rot_b;
-        child_ox_b = new_ox_b;
-        child_oy_b = new_oy_b;
-
-        (m_w, m_h)
-    } else {
-        (w, h)
-    };
+    let check_spacing = if spacing <= 1e-4 { 0.0 } else { spacing * 0.5 };
+    if polygons_collide_with_spacing(&poly_a_final, &poly_b_final, check_spacing) {
+        return None;
+    }
 
     let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
 
@@ -304,6 +319,9 @@ pub fn find_best_mating(
         collision_holes: part_a.collision_holes.clone(),
         color: part_a.color.clone(),
         draw_layers: part_a.draw_layers.clone(),
+        has_grain_label: part_a.has_grain_label,
+        grain_arrow_degrees: part_a.grain_arrow_degrees,
+        base_rotation_degrees: part_a.base_rotation_degrees,
     };
 
     let child_b = ClusterChild {
@@ -324,6 +342,9 @@ pub fn find_best_mating(
         collision_holes: part_b.collision_holes.clone(),
         color: part_b.color.clone(),
         draw_layers: part_b.draw_layers.clone(),
+        has_grain_label: part_b.has_grain_label,
+        grain_arrow_degrees: part_b.grain_arrow_degrees,
+        base_rotation_degrees: part_b.base_rotation_degrees,
     };
 
     Some(CombMatingResult {
@@ -348,6 +369,25 @@ pub fn try_build_comb_pair(
     let name_b = part_b.name.as_deref().unwrap_or("Part B");
     let area_a = part_a.area.unwrap_or(0.0);
     let area_b = part_b.area.unwrap_or(0.0);
+    let is_grain_locked = config.and_then(|c| c.rotation_divisions).map_or(true, |d| d <= 2)
+        || part_a.grain_locked == Some(true)
+        || part_b.grain_locked == Some(true)
+        || part_a.has_grain_label == Some(true)
+        || part_b.has_grain_label == Some(true);
+
+    let (macro_base_rot, ref_grain_arrow) = if part_a.has_grain_label == Some(true) || part_a.grain_locked == Some(true) {
+        let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
+        let child_rot_a = mating.child_a.rotation_degrees.unwrap_or(0.0);
+        (crate::packing::norm_angle(base_a - child_rot_a), part_a.grain_arrow_degrees.or(Some(0.0)))
+    } else if part_b.has_grain_label == Some(true) || part_b.grain_locked == Some(true) {
+        let base_b = part_b.base_rotation_degrees.or(part_b.rotation_degrees).unwrap_or(0.0);
+        let child_rot_b = mating.child_b.rotation_degrees.unwrap_or(0.0);
+        (crate::packing::norm_angle(base_b - child_rot_b), part_b.grain_arrow_degrees.or(Some(0.0)))
+    } else {
+        let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
+        let child_rot_a = mating.child_a.rotation_degrees.unwrap_or(0.0);
+        (crate::packing::norm_angle(base_a - child_rot_a), None)
+    };
 
     let macro_part = PartInput {
         entity_id: Some(format!("comb-macro:{}_{}", id_a, id_b)),
@@ -368,14 +408,23 @@ pub fn try_build_comb_pair(
         collision_contour: None,
         collision_holes: None,
         draw_layers: None,
-        rotations: Some(vec![0.0, 180.0]),
-        base_rotation_degrees: Some(0.0),
-        rotation_degrees: Some(0.0),
-        grain_locked: Some(true),
-        has_grain_label: Some(true),
-        grain_arrow_degrees: Some(0.0),
-        free_rotation: Some(false),
-        rotation_divisions: Some(2),
+        rotations: if is_grain_locked {
+            Some(vec![macro_base_rot, crate::packing::norm_angle(macro_base_rot + 180.0)])
+        } else {
+            Some(vec![
+                macro_base_rot,
+                crate::packing::norm_angle(macro_base_rot + 90.0),
+                crate::packing::norm_angle(macro_base_rot + 180.0),
+                crate::packing::norm_angle(macro_base_rot + 270.0),
+            ])
+        },
+        base_rotation_degrees: Some(macro_base_rot),
+        rotation_degrees: Some(macro_base_rot),
+        grain_locked: Some(is_grain_locked),
+        has_grain_label: Some(is_grain_locked),
+        grain_arrow_degrees: if is_grain_locked { ref_grain_arrow } else { None },
+        free_rotation: Some(!is_grain_locked),
+        rotation_divisions: Some(if is_grain_locked { 2 } else { 4 }),
         color: part_a.color.clone(),
         logical_part_count: Some(2),
         manual_cluster_macro: Some(true),
@@ -445,6 +494,9 @@ pub fn create_macro_part(
         collision_holes: part_a.collision_holes.clone(),
         color: part_a.color.clone(),
         draw_layers: part_a.draw_layers.clone(),
+        has_grain_label: part_a.has_grain_label,
+        grain_arrow_degrees: part_a.grain_arrow_degrees,
+        base_rotation_degrees: part_a.base_rotation_degrees,
     };
 
     let child_b = ClusterChild {
@@ -465,7 +517,19 @@ pub fn create_macro_part(
         collision_holes: part_b.collision_holes.clone(),
         color: part_b.color.clone(),
         draw_layers: part_b.draw_layers.clone(),
+        has_grain_label: part_b.has_grain_label,
+        grain_arrow_degrees: part_b.grain_arrow_degrees,
+        base_rotation_degrees: part_b.base_rotation_degrees,
     };
+
+    let is_grain_locked = part_a.grain_locked == Some(true)
+        || part_b.grain_locked == Some(true)
+        || part_a.has_grain_label == Some(true)
+        || part_b.has_grain_label == Some(true);
+
+    let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
+    let child_rot_a = offsets.rot_a;
+    let macro_base_rot = crate::packing::norm_angle(base_a - child_rot_a);
 
     PartInput {
         entity_id: Some(format!("comb-macro:{}_{}", id_a, id_b)),
@@ -486,14 +550,23 @@ pub fn create_macro_part(
         collision_contour: None,
         collision_holes: None,
         draw_layers: None,
-        rotations: Some(vec![0.0, 180.0]),
-        base_rotation_degrees: Some(0.0),
-        rotation_degrees: Some(0.0),
-        grain_locked: Some(true),
-        has_grain_label: Some(true),
-        grain_arrow_degrees: Some(0.0),
-        free_rotation: Some(false),
-        rotation_divisions: Some(2),
+        rotations: if is_grain_locked {
+            Some(vec![macro_base_rot, crate::packing::norm_angle(macro_base_rot + 180.0)])
+        } else {
+            Some(vec![
+                macro_base_rot,
+                crate::packing::norm_angle(macro_base_rot + 90.0),
+                crate::packing::norm_angle(macro_base_rot + 180.0),
+                crate::packing::norm_angle(macro_base_rot + 270.0),
+            ])
+        },
+        base_rotation_degrees: Some(macro_base_rot),
+        rotation_degrees: Some(macro_base_rot),
+        grain_locked: Some(is_grain_locked),
+        has_grain_label: Some(is_grain_locked),
+        grain_arrow_degrees: if is_grain_locked { part_a.grain_arrow_degrees.or(Some(0.0)) } else { None },
+        free_rotation: Some(!is_grain_locked),
+        rotation_divisions: Some(if is_grain_locked { 2 } else { 4 }),
         color: part_a.color.clone(),
         logical_part_count: Some(2),
         manual_cluster_macro: Some(true),
@@ -623,7 +696,7 @@ pub fn pair_comb_parts(
             area_b.partial_cmp(&area_a).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let window = 15;
+        let window = 40.min(sorted_rem.len());
         for i_pos in 0..sorted_rem.len() {
             let i = sorted_rem[i_pos];
             if used[i] { continue; }
@@ -779,7 +852,6 @@ mod tests {
 
         let mw = macro_p.width.unwrap();
         let mh = macro_p.height.unwrap();
-        assert!(mw <= mh, "Macro should be vertical: mw={} <= mh={}", mw, mh);
 
         let children = macro_p.manual_cluster_children.as_ref().unwrap();
         assert_eq!(children.len(), 2);
@@ -846,11 +918,156 @@ mod tests {
         let part_b = part_a.clone();
         let res = try_build_comb_pair(&part_a, &part_b, 0.0, None);
         assert!(res.is_some(), "Comb pair should succeed with spacing 0.0 (Value = 0 rule)");
-        let (macro_p, fill) = res.unwrap();
+        let (_macro_p, fill) = res.unwrap();
         assert!(fill >= 0.70);
-        let mw = macro_p.width.unwrap();
-        let mh = macro_p.height.unwrap();
-        assert!(mw <= mh);
+    }
+
+    #[test]
+    fn test_trapezoid_diagonal_mating_180_degrees() {
+        let trap_contour = vec![
+            [0.0, 0.0],
+            [380.0, 0.0],
+            [380.0, 400.0],
+            [0.0, 1100.0],
+        ];
+        let poly = Polygon::from_raw(&trap_contour);
+        let area = poly.area();
+
+        let part_a = PartInput {
+            id: Some("trap_1".to_string()),
+            entity_id: Some("ent_trap_1".to_string()),
+            name: Some("Trapezoid 1".to_string()),
+            width: Some(380.0),
+            height: Some(1100.0),
+            area: Some(area),
+            contour: trap_contour.clone(),
+            holes: None,
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: Some(vec![0.0, 180.0]),
+            base_rotation_degrees: Some(0.0),
+            rotation_degrees: Some(0.0),
+            grain_locked: Some(true),
+            has_grain_label: Some(true),
+            grain_arrow_degrees: Some(0.0),
+            free_rotation: Some(false),
+            rotation_divisions: Some(2),
+            color: None,
+            logical_part_count: Some(1),
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+        };
+        let part_b = PartInput {
+            id: Some("trap_2".to_string()),
+            entity_id: Some("ent_trap_2".to_string()),
+            name: Some("Trapezoid 2".to_string()),
+            ..part_a.clone()
+        };
+
+        let config = ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            cut_gap: Some(6.0),
+            part_spacing: Some(6.0),
+            rotation_divisions: Some(2),
+            rotate_step: Some(180.0),
+            compact_directions: Some(vec!["left".to_string(), "bottom".to_string()]),
+            target_sheet_utilization: Some(90.0),
+            sheet_in_sheet: Some(false),
+            selective_repack: Some(false),
+            small_part_threshold: Some(0.0),
+            small_part_clearance: Some(0.0),
+            small_part_edge_zone: Some(0.0),
+            merge_cut_paths: Some(false),
+        };
+
+        let res = try_build_comb_pair(&part_a, &part_b, 6.0, Some(&config));
+        assert!(res.is_some(), "Two trapezoids must mate along diagonal edge!");
+        let (macro_p, fill) = res.unwrap();
+        println!("Mated trapezoid macro: w={}, h={}, fill={}", macro_p.width.unwrap(), macro_p.height.unwrap(), fill);
+        let children = macro_p.manual_cluster_children.as_ref().unwrap();
+        assert_eq!(children.len(), 2);
+        println!("Child 0: rot={:?}, ox={:?}, oy={:?}", children[0].rotation_degrees, children[0].offset_x, children[0].offset_y);
+        println!("Child 1: rot={:?}, ox={:?}, oy={:?}", children[1].rotation_degrees, children[1].offset_x, children[1].offset_y);
+        println!("Macro rotations={:?}, base_rot={:?}", macro_p.rotations, macro_p.base_rotation_degrees);
+        assert!(fill >= 0.85, "Mated rectangle fill rate should be high, got {}", fill);
+        let rot_diff = (children[1].rotation_degrees.unwrap() - children[0].rotation_degrees.unwrap()).abs();
+        assert_eq!(rot_diff.round() as i64 % 360, 180, "Child 2 must be rotated 180 degrees");
+    }
+
+    #[test]
+    fn test_trapezoid_mating_with_base_rotation_90() {
+        let trap_contour = vec![
+            [0.0, 0.0],
+            [1100.0, 0.0],
+            [400.0, 380.0],
+            [0.0, 380.0],
+        ];
+        let poly = Polygon::from_raw(&trap_contour);
+        let area = poly.area();
+
+        let part_a = PartInput {
+            id: Some("trap_x1".to_string()),
+            entity_id: Some("ent_trap_x1".to_string()),
+            name: Some("Trapezoid X1".to_string()),
+            width: Some(1100.0),
+            height: Some(380.0),
+            area: Some(area),
+            contour: trap_contour.clone(),
+            holes: None,
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: Some(vec![270.0, 90.0]),
+            base_rotation_degrees: Some(270.0),
+            rotation_degrees: Some(270.0),
+            grain_locked: Some(true),
+            has_grain_label: Some(true),
+            grain_arrow_degrees: Some(0.0),
+            free_rotation: Some(false),
+            rotation_divisions: Some(2),
+            color: None,
+            logical_part_count: Some(1),
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+        };
+        let part_b = PartInput {
+            id: Some("trap_x2".to_string()),
+            entity_id: Some("ent_trap_x2".to_string()),
+            name: Some("Trapezoid X2".to_string()),
+            ..part_a.clone()
+        };
+
+        let config = ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            cut_gap: Some(6.0),
+            part_spacing: Some(6.0),
+            rotation_divisions: Some(2),
+            rotate_step: Some(180.0),
+            compact_directions: Some(vec!["left".to_string(), "bottom".to_string()]),
+            target_sheet_utilization: Some(90.0),
+            sheet_in_sheet: Some(false),
+            selective_repack: Some(false),
+            small_part_threshold: Some(0.0),
+            small_part_clearance: Some(0.0),
+            small_part_edge_zone: Some(0.0),
+            merge_cut_paths: Some(false),
+        };
+
+        let res = try_build_comb_pair(&part_a, &part_b, 6.0, Some(&config));
+        assert!(res.is_some(), "Trapezoids with length along X and base_rot=270 must mate!");
+        let (macro_p, fill) = res.unwrap();
+        assert!(fill >= 0.85);
+        assert_eq!(macro_p.base_rotation_degrees, Some(270.0));
+        assert_eq!(macro_p.rotations, Some(vec![270.0, 90.0]));
     }
 
     #[test]
@@ -1062,6 +1279,74 @@ mod tests {
             }
         }
         assert!(min_dist >= 6.0 - 1e-3, "Minimum clearance must be >= 6.0mm, got {}", min_dist);
+    }
+
+    #[test]
+    fn test_wood_grain_rotation_rules() {
+        let part = PartInput {
+            entity_id: Some("P1".to_string()),
+            id: Some("1".to_string()),
+            name: Some("Test Part".to_string()),
+            width: Some(400.0),
+            height: Some(600.0),
+            area: Some(240000.0),
+            contour: vec![
+                [0.0, 0.0],
+                [400.0, 0.0],
+                [400.0, 600.0],
+                [0.0, 600.0],
+            ],
+            holes: None,
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: None,
+            base_rotation_degrees: Some(270.0),
+            rotation_degrees: Some(270.0),
+            grain_locked: Some(true),
+            has_grain_label: Some(true),
+            grain_arrow_degrees: Some(0.0),
+            free_rotation: Some(false),
+            rotation_divisions: None,
+            color: None,
+            logical_part_count: Some(1),
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+        };
+
+        // Case 1: Dropdown "Vân Gỗ" (rotation_divisions = 1)
+        let config_van_go = ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            cut_gap: Some(6.0),
+            part_spacing: Some(6.0),
+            rotation_divisions: Some(1),
+            rotate_step: Some(180.0),
+            compact_directions: Some(vec!["left".to_string(), "bottom".to_string()]),
+            target_sheet_utilization: Some(90.0),
+            sheet_in_sheet: Some(false),
+            selective_repack: Some(false),
+            small_part_threshold: Some(0.0),
+            small_part_clearance: Some(0.0),
+            small_part_edge_zone: Some(0.0),
+            merge_cut_paths: Some(false),
+        };
+
+        let prepared_vg = crate::packing::prepare_parts(&[part.clone()], &config_van_go, 6.0);
+        let rots_vg: Vec<f64> = prepared_vg[0].variants.iter().map(|v| v.rotation).collect();
+        // MUST ONLY have 0 deg and 180 deg relative to base_rot (270.0 and 90.0)
+        assert_eq!(rots_vg, vec![270.0, 90.0]);
+
+        // Case 2: Dropdown "Xoay Tự Do" (rotation_divisions = 4)
+        let mut config_tu_do = config_van_go.clone();
+        config_tu_do.rotation_divisions = Some(4);
+        let prepared_td = crate::packing::prepare_parts(&[part], &config_tu_do, 6.0);
+        let rots_td: Vec<f64> = prepared_td[0].variants.iter().map(|v| v.rotation).collect();
+        // MUST have all 4 rotations
+        assert_eq!(rots_td, vec![270.0, 0.0, 90.0, 180.0]);
     }
 }
 

@@ -33,13 +33,24 @@ fn is_cancelled(cancel_path: Option<&PathBuf>) -> bool {
 }
 
 fn write_json_atomic<T: serde::Serialize>(target_path: &Path, data: &T) {
+    let Ok(json_str) = serde_json::to_string(data) else { return; };
     let tmp_path = target_path.with_extension("tmp");
-    if let Ok(json_str) = serde_json::to_string(data) {
-        if let Ok(mut f) = File::create(&tmp_path) {
-            let _ = f.write_all(json_str.as_bytes());
-            let _ = f.flush();
-            drop(f);
-            let _ = std::fs::rename(&tmp_path, target_path);
+    if let Ok(mut f) = File::create(&tmp_path) {
+        let _ = f.write_all(json_str.as_bytes());
+        let _ = f.flush();
+        drop(f);
+
+        let mut replaced = false;
+        for _ in 0..5 {
+            if std::fs::rename(&tmp_path, target_path).is_ok() {
+                replaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !replaced {
+            let _ = std::fs::copy(&tmp_path, target_path);
+            let _ = std::fs::remove_file(&tmp_path);
         }
     }
 }

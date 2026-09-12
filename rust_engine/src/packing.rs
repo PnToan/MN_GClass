@@ -111,10 +111,18 @@ pub fn prepare_parts(
             let mut r: Vec<f64> = rots.iter().map(|&d| norm_angle(d)).collect();
             if r.is_empty() { r.push(base_rot); }
             r
-        } else if p.grain_locked == Some(true) {
-            vec![base_rot]
-        } else if global_rot_div == 2 {
-            vec![base_rot, norm_angle(base_rot + 180.0)]
+        } else if p.grain_locked == Some(true) || p.has_grain_label == Some(true) {
+            let p_rot_div = p.rotation_divisions.unwrap_or(global_rot_div);
+            if p_rot_div >= 4 || p.free_rotation == Some(true) {
+                vec![
+                    base_rot,
+                    norm_angle(base_rot + 90.0),
+                    norm_angle(base_rot + 180.0),
+                    norm_angle(base_rot + 270.0),
+                ]
+            } else {
+                vec![base_rot, norm_angle(base_rot + 180.0)]
+            }
         } else if global_rot_div >= 4 || p.free_rotation == Some(true) {
             vec![
                 base_rot,
@@ -129,7 +137,7 @@ pub fn prepare_parts(
             ]
         };
 
-        if (global_rot_div >= 4 || p.free_rotation == Some(true)) && p.grain_locked != Some(true) {
+        if (global_rot_div >= 4 || p.free_rotation == Some(true)) && p.grain_locked != Some(true) && p.has_grain_label != Some(true) {
             let fits_initially = allowed_rotations.iter().any(|&rot| {
                 let rot_poly = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
                 let bbox = rot_poly.bounding_box();
@@ -631,7 +639,9 @@ where
 
         let mut placed_any_on_this_sheet = false;
 
+        let mut pass_count = 0;
         loop {
+            pass_count += 1;
             let mut placed_in_this_pass = false;
 
             // Bước A: Ưu tiên nhét chi tiết hình vuông / chữ nhật vào các hốc rỗng trên tấm này
@@ -660,8 +670,9 @@ where
             }
 
             // Nếu quét qua toàn bộ các chi tiết còn lại mà không thể nhét thêm bất kỳ chi tiết nào,
-            // nghĩa là tấm hiện tại ĐÃ ĐẦY 100%. Dừng lặp và chỉ khi đó mới chuyển sang mở tấm tiếp theo!
-            if !placed_in_this_pass {
+            // hoặc đã lặp đủ 2 pass (pass 1 đặt các chi tiết ưu tiên, pass 2 lấp nốt vào các khoảng trống phát sinh),
+            // thì tấm hiện tại đã đạt mật độ tối đa. Chuyển sang mở tấm tiếp theo!
+            if !placed_in_this_pass || pass_count >= 2 {
                 break;
             }
         }

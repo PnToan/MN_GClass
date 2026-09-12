@@ -21,14 +21,18 @@ pub fn consolidate_sheets(
     let board_area = board_w * board_h;
 
     let mut changed = false;
-    let mut max_rounds = 2;
 
-    while max_rounds > 0 {
-        max_rounds -= 1;
-        let mut removed_sheet = false;
+    if layout.sheets.len() > 1 {
 
-        if layout.sheets.len() <= 1 {
-            break;
+        let last_idx = layout.sheets.len() - 1;
+        let last_sheet_area: f64 = layout.sheets[last_idx].placements.iter().map(|p| p.area).sum();
+        let total_free_area: f64 = layout.sheets[0..last_idx].iter().map(|s| {
+            let used: f64 = s.placements.iter().map(|p| p.area).sum();
+            (board_area - used).max(0.0)
+        }).sum();
+
+        if total_free_area < last_sheet_area {
+            return false;
         }
 
         // Rebuild contexts for all current sheets
@@ -61,23 +65,15 @@ pub fn consolidate_sheets(
             ctx
         }).collect();
 
-        let _total_sheets = layout.sheets.len();
-        let min_src_idx = 1;
-
         let mut sheet_used_area: Vec<f64> = layout.sheets.iter().map(|s| {
             s.placements.iter().map(|p| p.area).sum()
         }).collect();
 
-        // Iterate from last sheet backwards (tail sheets only)
-        for src_idx in (min_src_idx..layout.sheets.len()).rev() {
-            if layout.sheets[src_idx].placements.is_empty() {
-                layout.sheets.remove(src_idx);
-                contexts.remove(src_idx);
-                removed_sheet = true;
-                changed = true;
-                break;
-            }
-
+        let src_idx = last_idx;
+        if layout.sheets[src_idx].placements.is_empty() {
+            layout.sheets.remove(src_idx);
+            changed = true;
+        } else {
             let mut remaining_placements = Vec::new();
             let src_placements = std::mem::take(&mut layout.sheets[src_idx].placements);
 
@@ -206,17 +202,10 @@ pub fn consolidate_sheets(
             if remaining_placements.is_empty() {
                 // Whole sheet absorbed! Remove it
                 layout.sheets.remove(src_idx);
-                contexts.remove(src_idx);
-                removed_sheet = true;
                 changed = true;
-                break;
             } else {
                 layout.sheets[src_idx].placements = remaining_placements;
             }
-        }
-
-        if !removed_sheet {
-            break;
         }
     }
 
@@ -278,26 +267,28 @@ where
     on_progress("Tối ưu sơ bộ", 60.0, initial_layout.sheets.len(), 0, &initial_layout);
     let mut best_layout = initial_layout;
 
-    // 2. Parallel multi-strategy exploration (all strategies pack rectangular macros)
+    // 2. Parallel multi-strategy exploration (bounded 4-8 strategies for high speed)
     let num_threads = rayon::current_num_threads();
-    let num_strategies = (num_threads * 2).max(24);
+    let num_strategies = num_threads.clamp(4, 8);
 
-    let candidate_layouts: Vec<LayoutOutput> = (1..=num_strategies)
-        .into_par_iter()
-        .map(|strategy_id| {
-            let mut layout = pack_material(&paired_material_state, strategy_id);
-            consolidate_sheets(&mut layout, global_rot_div, sheet_in_sheet, &compact_directions);
-            layout
-        })
-        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    (1..=num_strategies).into_par_iter().for_each_with(tx, |s, strategy_id| {
+        let mut layout = pack_material(&paired_material_state, strategy_id);
+        consolidate_sheets(&mut layout, global_rot_div, sheet_in_sheet, &compact_directions);
+        let _ = s.send((strategy_id, layout));
+    });
 
-    for (idx, layout) in candidate_layouts.into_iter().enumerate() {
+    let mut completed_count = 0;
+    while let Ok((_strat_id, layout)) = rx.recv() {
+        completed_count += 1;
         let score_cand = LayoutScore::compute(&layout);
         let score_best = LayoutScore::compute(&best_layout);
-        let strategy_pct = 60.0 + ((idx + 1) as f64 / num_strategies as f64) * 35.0;
+        let strategy_pct = 60.0 + (completed_count as f64 / num_strategies as f64) * 35.0;
         if score_cand < score_best {
             best_layout = layout;
-            on_progress("Tối ưu đa luồng", strategy_pct, idx + 1, num_strategies, &best_layout);
+            on_progress("Tối ưu đa luồng", strategy_pct, completed_count, num_strategies, &best_layout);
+        } else {
+            on_progress("Tối ưu đa luồng", strategy_pct, completed_count, num_strategies, &best_layout);
         }
     }
 

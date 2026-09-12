@@ -110,9 +110,8 @@ impl Polygon {
     }
 
     pub fn from_raw(raw: &[[f64; 2]]) -> Self {
-        Polygon {
-            points: raw.iter().map(|p| Point::new(p[0], p[1])).collect(),
-        }
+        let pts: Vec<Point> = raw.iter().map(|p| Point::new(p[0], p[1])).collect();
+        Polygon { points: pts }
     }
 
     pub fn to_raw(&self) -> Vec<[f64; 2]> {
@@ -155,13 +154,18 @@ impl Polygon {
     }
 
     pub fn is_rectangular(&self) -> bool {
-        let n = self.points.len();
-        if n != 4 {
+        let clean = if self.points.len() > 4 {
+            simplify_collinear(&self.points, 0.5)
+        } else {
+            self.points.clone()
+        };
+        if clean.len() != 4 {
             return false;
         }
-        let bbox = self.bounding_box();
+        let clean_poly = Polygon::new(clean);
+        let bbox = clean_poly.bounding_box();
         let bbox_area = bbox.area();
-        let poly_area = self.area();
+        let poly_area = clean_poly.area();
         if bbox_area <= 0.0 {
             return false;
         }
