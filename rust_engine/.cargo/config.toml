@@ -1,0 +1,2 @@
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-LC:/Users/PC/AppData/Roaming/SketchUp/SKF01E~1/SketchUp/Plugins/mn_gcode/data/engine/RUST_E~1/lib"]
