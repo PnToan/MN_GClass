@@ -1,0 +1,33 @@
+name: Build macOS Nesting Engine
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'data/engine/rust_engine/**'
+      - '.github/workflows/build_mac_engine.yml'
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Make build script executable
+        run: chmod +x data/engine/rust_engine/build_mac.sh
+
+      - name: Build macOS Universal Binary
+        run: ./data/engine/rust_engine/build_mac.sh
+
+      - name: Upload macOS Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mn_nesting_engine-macos
+          path: data/engine/mn_nesting_engine
+          if-no-files-found: error
