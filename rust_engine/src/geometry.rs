@@ -568,6 +568,10 @@ pub fn is_truly_irregular(poly: &Polygon, bbox: &Rect, area: f64) -> bool {
         return false;
     }
 
+    if poly.is_circular() {
+        return false;
+    }
+
     let simplified = simplify_collinear(&poly.points, 0.5);
     if simplified.len() < 3 {
         return false;
@@ -602,5 +606,283 @@ pub fn is_truly_irregular(poly: &Polygon, bbox: &Rect, area: f64) -> bool {
 
     let p = Polygon::new(simplified);
     !p.is_rectangular()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_circle(radius: f64, segments: usize) -> Polygon {
+        let mut pts = Vec::with_capacity(segments);
+        for i in 0..segments {
+            let angle = 2.0 * std::f64::consts::PI * (i as f64) / (segments as f64);
+            pts.push(Point::new(radius * angle.cos(), radius * angle.sin()));
+        }
+        let poly = Polygon::new(pts);
+        let (norm, _, _) = poly.normalize_to_origin();
+        norm
+    }
+
+    #[test]
+    fn test_circle_collision() {
+        let c1 = make_circle(100.0, 24);
+        let c2 = make_circle(100.0, 24);
+        let c2_shifted = c2.translate(0.0, 150.0);
+        assert!(polygons_collide_with_spacing(&c1, &c2_shifted, 6.0));
+    }
+
+    #[test]
+    fn test_circle_sheet_context() {
+        let c1 = make_circle(100.0, 24);
+        let c2 = make_circle(100.0, 24);
+        let mut ctx = crate::nfp::SheetContext::new(2440.0, 1220.0, 10.0, 6.0, 0.0, false, false, vec!["left".into(), "bottom".into()]);
+        ctx.add_placed(c1.clone(), vec![], 10.0, 10.0, 0.0, false, 0.0);
+        
+        let dilated = offset_polygon(&c2, 3.0);
+        let dilated_bbox = dilated.bounding_box();
+        let can_place = ctx.can_place_precomputed(&c2, &dilated, &dilated_bbox, false, 10.0, 150.0, false, 0.0);
+        assert!(!can_place);
+
+        let anchor = ctx.find_best_anchor(&c2, &dilated, &dilated_bbox, false, false, 0.0, 1.0);
+        assert!(anchor.is_some());
+        let (x, y, _) = anchor.unwrap();
+        assert!(!polygons_collide_with_spacing(&c1.translate(10.0, 10.0), &c2.translate(x, y), 6.0));
+    }
+
+    #[test]
+    fn test_pack_circles() {
+        let c = make_circle(100.0, 24);
+        let mut parts = Vec::new();
+        for i in 0..10 {
+            parts.push(crate::types::PartInput {
+                id: Some(format!("C{}", i)),
+                entity_id: Some(format!("C{}", i)),
+                name: Some(format!("Circle {}", i)),
+                contour: c.to_raw(),
+                holes: None,
+                width: Some(200.0),
+                height: Some(200.0),
+                area: Some(std::f64::consts::PI * 10000.0),
+                render_contour: None,
+                render_holes: None,
+                collision_contour: None,
+                collision_holes: None,
+                draw_layers: None,
+                rotations: None,
+                base_rotation_degrees: None,
+                rotation_degrees: None,
+                grain_locked: None,
+                has_grain_label: None,
+                grain_arrow_degrees: None,
+                free_rotation: None,
+                rotation_divisions: None,
+                color: None,
+                logical_part_count: None,
+                manual_cluster_macro: None,
+                manual_cluster_children: None,
+            });
+        }
+        let config = crate::types::ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            part_spacing: Some(6.0),
+            cut_gap: Some(6.0),
+            rotation_divisions: Some(4),
+            ..Default::default()
+        };
+        let mat_state = crate::types::MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(config),
+            original_part_count: None,
+            parts,
+            learning_key: None,
+        };
+        let layout = crate::packing::pack_material(&mat_state, 0);
+        for sheet in &layout.sheets {
+            for i in 0..sheet.placements.len() {
+                let p1 = &sheet.placements[i];
+                let poly1 = Polygon::from_raw(&p1.contour).translate(p1.x, p1.y);
+                for j in (i + 1)..sheet.placements.len() {
+                    let p2 = &sheet.placements[j];
+                    let poly2 = Polygon::from_raw(&p2.contour).translate(p2.x, p2.y);
+                    let collides = polygons_collide_with_spacing(&poly1, &poly2, 6.0);
+                    assert!(!collides, "Collision between {} and {} at ({}, {}) and ({}, {})", 
+                        p1.name.as_deref().unwrap_or(""), p2.name.as_deref().unwrap_or(""), p1.x, p1.y, p2.x, p2.y);
+                }
+            }
+        }
+
+        let opt_layout = crate::epochs::optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});
+        for sheet in &opt_layout.sheets {
+            for i in 0..sheet.placements.len() {
+                let p1 = &sheet.placements[i];
+                let poly1 = Polygon::from_raw(&p1.contour).translate(p1.x, p1.y);
+                for j in (i + 1)..sheet.placements.len() {
+                    let p2 = &sheet.placements[j];
+                    let poly2 = Polygon::from_raw(&p2.contour).translate(p2.x, p2.y);
+                    let collides = polygons_collide_with_spacing(&poly1, &poly2, 6.0);
+                    assert!(!collides, "Collision in opt_layout between {} and {} at ({}, {}) and ({}, {})", 
+                        p1.name.as_deref().unwrap_or(""), p2.name.as_deref().unwrap_or(""), p1.x, p1.y, p2.x, p2.y);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_circle_mating() {
+        let c = make_circle(100.0, 24);
+        let part = crate::types::PartInput {
+            id: Some("C1".into()),
+            entity_id: Some("C1".into()),
+            name: Some("Circle 1".into()),
+            contour: c.to_raw(),
+            holes: None,
+            width: Some(200.0),
+            height: Some(200.0),
+            area: Some(std::f64::consts::PI * 10000.0),
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: None,
+            base_rotation_degrees: None,
+            rotation_degrees: None,
+            grain_locked: None,
+            has_grain_label: None,
+            grain_arrow_degrees: None,
+            free_rotation: None,
+            rotation_divisions: None,
+            color: None,
+            logical_part_count: None,
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+        };
+        let config = crate::types::ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            part_spacing: Some(6.0),
+            cut_gap: Some(6.0),
+            rotation_divisions: Some(4),
+            ..Default::default()
+        };
+        let mating = crate::macro_comb::find_best_mating(&part, &part, 6.0, Some(&config));
+        assert!(mating.is_none(), "Circles must never mate into comb macros");
+    }
+
+    #[test]
+    fn test_simulate_sheet13() {
+        let c = make_circle(200.0, 24); // diameter 400
+        let mut parts = Vec::new();
+        // 5 circles
+        for i in 0..5 {
+            parts.push(crate::types::PartInput {
+                id: Some(format!("Circle_{}", i)),
+                entity_id: Some(format!("Circle_{}", i)),
+                name: Some(format!("Circle {}", i)),
+                contour: c.to_raw(),
+                holes: None,
+                width: Some(400.0),
+                height: Some(400.0),
+                area: Some(std::f64::consts::PI * 40000.0),
+                render_contour: None,
+                render_holes: None,
+                collision_contour: None,
+                collision_holes: None,
+                draw_layers: None,
+                rotations: None,
+                base_rotation_degrees: None,
+                rotation_degrees: None,
+                grain_locked: None,
+                has_grain_label: None,
+                grain_arrow_degrees: None,
+                free_rotation: None,
+                rotation_divisions: Some(4),
+                color: None,
+                logical_part_count: None,
+                manual_cluster_macro: None,
+                manual_cluster_children: None,
+            });
+        }
+        // 10 right triangles (400 x 400)
+        let tri_contour = vec![[0.0, 0.0], [400.0, 0.0], [0.0, 400.0]];
+        for i in 0..10 {
+            parts.push(crate::types::PartInput {
+                id: Some(format!("Tri_{}", i)),
+                entity_id: Some(format!("Tri_{}", i)),
+                name: Some(format!("Tri {}", i)),
+                contour: tri_contour.clone(),
+                holes: None,
+                width: Some(400.0),
+                height: Some(400.0),
+                area: Some(80000.0),
+                render_contour: None,
+                render_holes: None,
+                collision_contour: None,
+                collision_holes: None,
+                draw_layers: None,
+                rotations: None,
+                base_rotation_degrees: None,
+                rotation_degrees: None,
+                grain_locked: None,
+                has_grain_label: None,
+                grain_arrow_degrees: None,
+                free_rotation: None,
+                rotation_divisions: Some(4),
+                color: None,
+                logical_part_count: None,
+                manual_cluster_macro: None,
+                manual_cluster_children: None,
+            });
+        }
+
+        let config = crate::types::ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            part_spacing: Some(7.0),
+            cut_gap: Some(7.0),
+            rotation_divisions: Some(4),
+            merge_cut_paths: Some(false),
+            small_part_threshold: Some(150.0),
+            small_part_clearance: Some(15.0),
+            ..Default::default()
+        };
+        let mat_state = crate::types::MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(config),
+            original_part_count: None,
+            parts,
+            learning_key: None,
+        };
+
+        let opt_layout = crate::epochs::optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});
+        for sheet in &opt_layout.sheets {
+            for p in &sheet.placements {
+                if p.name.as_deref().unwrap_or("").starts_with("Circle") {
+                    assert_ne!(p.manual_cluster_macro, Some(true), "Circle must not be a macro");
+                }
+            }
+            for i in 0..sheet.placements.len() {
+                let p1 = &sheet.placements[i];
+                let poly1 = Polygon::from_raw(&p1.contour).translate(p1.x, p1.y);
+                for j in (i + 1)..sheet.placements.len() {
+                    let p2 = &sheet.placements[j];
+                    let poly2 = Polygon::from_raw(&p2.contour).translate(p2.x, p2.y);
+                    let collides = polygons_collide_with_spacing(&poly1, &poly2, 7.0);
+                    assert!(!collides, "Collision between {} and {} at ({}, {}) and ({}, {})",
+                        p1.name.as_deref().unwrap_or(""), p2.name.as_deref().unwrap_or(""), p1.x, p1.y, p2.x, p2.y);
+                }
+            }
+        }
+    }
 }
 

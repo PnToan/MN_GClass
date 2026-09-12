@@ -39,6 +39,9 @@ pub fn find_best_mating(
 
     let poly_a = Polygon::from_raw(&part_a.contour);
     let poly_b = Polygon::from_raw(&part_b.contour);
+    if poly_a.is_circular() || poly_b.is_circular() {
+        return None;
+    }
     let poly_orig_ccw_a = ensure_ccw(&poly_a);
     let poly_orig_ccw_b = ensure_ccw(&poly_b);
 
@@ -614,6 +617,10 @@ pub fn pair_comb_parts(
             continue;
         }
         let poly = Polygon::from_raw(&p.contour);
+        if poly.is_circular() {
+            signatures.push(String::new());
+            continue;
+        }
         let bbox = poly.bounding_box();
         let area = p.area.unwrap_or_else(|| poly.area());
         if is_truly_irregular(&poly, &bbox, area) {
