@@ -68,6 +68,7 @@ pub struct ProcessedPart {
     pub small_part: bool,
     pub small_part_clearance: f64,
     pub variants: Vec<RotatedVariant>,
+    pub is_grain_locked: bool,
 }
 
 pub fn prepare_parts(
@@ -105,24 +106,38 @@ pub fn prepare_parts(
         let is_irregular = !poly.is_rectangular();
         let is_rect = poly.is_rectangular() && p.holes.as_ref().map_or(true, |h| h.is_empty());
 
+        let has_child_grain = p.manual_cluster_macro == Some(true) && p.manual_cluster_children.as_ref().map_or(false, |children| {
+            children.iter().any(|c| c.has_grain_label == Some(true) || c.grain_arrow_degrees.is_some() || c.base_rotation_degrees.is_some())
+        });
+        let is_part_grain_locked = (global_rot_div <= 2)
+            || (p.grain_locked == Some(true))
+            || (p.has_grain_label == Some(true))
+            || has_child_grain;
         let base_rot = norm_angle(p.base_rotation_degrees.or(p.rotation_degrees).unwrap_or(0.0));
 
-        let mut allowed_rotations: Vec<f64> = if let Some(rots) = &p.rotations {
-            let mut r: Vec<f64> = rots.iter().map(|&d| norm_angle(d)).collect();
-            if r.is_empty() { r.push(base_rot); }
-            r
-        } else if p.grain_locked == Some(true) || p.has_grain_label == Some(true) {
-            let p_rot_div = p.rotation_divisions.unwrap_or(global_rot_div);
-            if p_rot_div >= 4 || p.free_rotation == Some(true) {
-                vec![
-                    base_rot,
-                    norm_angle(base_rot + 90.0),
-                    norm_angle(base_rot + 180.0),
-                    norm_angle(base_rot + 270.0),
-                ]
+        let mut allowed_rotations: Vec<f64> = if is_part_grain_locked {
+            // Quy tắc vân gỗ tuyệt đối: chiều mũi tên theo chiều dài 2440, chỉ xoay 0 hoặc 180 độ.
+            // Tuyệt đối không cho phép 90 hoặc 270 độ, bất kể free_rotation hay global_rot_div.
+            if let Some(rots) = &p.rotations {
+                let r: Vec<f64> = rots.iter()
+                    .map(|&d| norm_angle(d))
+                    .filter(|&rot| {
+                        let diff = (rot - base_rot).abs() % 180.0;
+                        diff <= 2.0 || diff >= 178.0
+                    })
+                    .collect();
+                if !r.is_empty() {
+                    r
+                } else {
+                    vec![base_rot, norm_angle(base_rot + 180.0)]
+                }
             } else {
                 vec![base_rot, norm_angle(base_rot + 180.0)]
             }
+        } else if let Some(rots) = &p.rotations {
+            let mut r: Vec<f64> = rots.iter().map(|&d| norm_angle(d)).collect();
+            if r.is_empty() { r.push(base_rot); }
+            r
         } else if global_rot_div >= 4 || p.free_rotation == Some(true) {
             vec![
                 base_rot,
@@ -137,7 +152,7 @@ pub fn prepare_parts(
             ]
         };
 
-        if (global_rot_div >= 4 || p.free_rotation == Some(true)) && p.grain_locked != Some(true) && p.has_grain_label != Some(true) {
+        if (global_rot_div >= 4 || p.free_rotation == Some(true)) && !is_part_grain_locked {
             let fits_initially = allowed_rotations.iter().any(|&rot| {
                 let rot_poly = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
                 let bbox = rot_poly.bounding_box();
@@ -276,6 +291,7 @@ pub fn prepare_parts(
             small_part,
             small_part_clearance,
             variants: final_variants,
+            is_grain_locked: is_part_grain_locked,
         }
     }).collect()
 }
@@ -522,8 +538,9 @@ where
                 manual_cluster_macro: part.original.manual_cluster_macro,
                 manual_cluster_children: part.original.manual_cluster_children.clone(),
                 logical_part_count: part.original.logical_part_count,
-                has_grain_label: part.original.has_grain_label,
+                has_grain_label: if part.is_grain_locked { Some(true) } else { part.original.has_grain_label },
                 grain_arrow_degrees: part.original.grain_arrow_degrees,
+                grain_locked: Some(part.is_grain_locked),
                 small_part: Some(part.small_part),
                 small_part_clearance: Some(part.small_part_clearance),
                 small_part_edge_protected: Some(sheet.small_part_edge_protected(
@@ -598,8 +615,9 @@ where
                 manual_cluster_macro: part.original.manual_cluster_macro,
                 manual_cluster_children: part.original.manual_cluster_children.clone(),
                 logical_part_count: part.original.logical_part_count,
-                has_grain_label: part.original.has_grain_label,
+                has_grain_label: if part.is_grain_locked { Some(true) } else { part.original.has_grain_label },
                 grain_arrow_degrees: part.original.grain_arrow_degrees,
+                grain_locked: Some(part.is_grain_locked),
                 small_part: Some(part.small_part),
                 small_part_clearance: Some(part.small_part_clearance),
                 small_part_edge_protected: Some(sheet.small_part_edge_protected(

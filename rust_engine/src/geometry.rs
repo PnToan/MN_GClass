@@ -243,15 +243,25 @@ impl Polygon {
         if n < 3 {
             return false;
         }
+        let bbox = self.bounding_box();
+        if p.x < bbox.min_x - 1e-4
+            || p.x > bbox.max_x + 1e-4
+            || p.y < bbox.min_y - 1e-4
+            || p.y > bbox.max_y + 1e-4
+        {
+            return false;
+        }
         let mut inside = false;
         let mut j = n - 1;
         for i in 0..n {
             let pi = self.points[i];
             let pj = self.points[j];
-            if ((pi.y > p.y) != (pj.y > p.y))
-                && (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y + 1e-12) + pi.x)
-            {
-                inside = !inside;
+            let dy = pj.y - pi.y;
+            if dy.abs() > 1e-9 && ((pi.y > p.y) != (pj.y > p.y)) {
+                let intersect_x = (pj.x - pi.x) * (p.y - pi.y) / dy + pi.x;
+                if p.x < intersect_x {
+                    inside = !inside;
+                }
             }
             j = i;
         }

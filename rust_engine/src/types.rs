@@ -215,6 +215,7 @@ pub struct PlacementOutput {
     pub logical_part_count: Option<usize>,
     pub has_grain_label: Option<bool>,
     pub grain_arrow_degrees: Option<f64>,
+    pub grain_locked: Option<bool>,
     pub small_part: Option<bool>,
     pub small_part_clearance: Option<f64>,
     pub small_part_edge_protected: Option<bool>,

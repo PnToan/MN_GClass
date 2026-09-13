@@ -82,12 +82,17 @@ pub fn consolidate_sheets(
                 let poly = Polygon::from_raw(&p.contour);
                 let p_area = p.area;
                 let curr_rot = p.rotation_degrees;
-                let is_grain = (global_rot_div == 1)
-                    || (p.has_grain_label == Some(true) && global_rot_div == 1)
+                let is_grain = (global_rot_div <= 2)
+                    || (p.has_grain_label == Some(true))
+                    || (p.grain_locked == Some(true))
                     || (p.manual_cluster_macro == Some(true));
 
                 let allowed_rotations = if is_grain {
-                    vec![0.0, 180.0]
+                    if global_rot_div == 1 && p.has_grain_label != Some(true) && p.grain_locked != Some(true) {
+                        vec![0.0]
+                    } else {
+                        vec![0.0, 180.0]
+                    }
                 } else {
                     vec![0.0, 90.0, 180.0, 270.0]
                 };
@@ -303,4 +308,112 @@ where
     best_layout.target_deficit_score = final_score.target_deficit;
 
     best_layout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{PlacementOutput, SheetOutput};
+
+    #[test]
+    fn test_consolidate_sheets_strictly_preserves_grain_rotation() {
+        let contour = vec![
+            [0.0, 0.0],
+            [400.0, 0.0],
+            [400.0, 200.0],
+            [0.0, 200.0],
+        ];
+
+        let p_sheet1 = PlacementOutput {
+            entity_id: "e1".to_string(),
+            id: "1".to_string(),
+            name: Some("Part 1".to_string()),
+            x: 10.0,
+            y: 10.0,
+            rotation_degrees: 0.0,
+            base_rotation_degrees: Some(0.0),
+            width: 400.0,
+            height: 200.0,
+            packed_width: 400.0,
+            packed_height: 200.0,
+            area: 80000.0,
+            contour: contour.clone(),
+            holes: None,
+            draw_layers: None,
+            color: None,
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+            logical_part_count: Some(1),
+            has_grain_label: Some(true),
+            grain_arrow_degrees: Some(0.0),
+            grain_locked: Some(true),
+            small_part: Some(false),
+            small_part_clearance: Some(0.0),
+            small_part_edge_protected: Some(false),
+        };
+
+        let mut p_sheet2 = p_sheet1.clone();
+        p_sheet2.entity_id = "e2".to_string();
+        p_sheet2.id = "2".to_string();
+
+        let mut layout = LayoutOutput {
+            material: "MDF".to_string(),
+            thickness: 17.0,
+            board_width: 2440.0,
+            board_height: 1220.0,
+            edge_margin: 10.0,
+            part_spacing: 6.0,
+            cut_gap: Some(6.0),
+            small_part_threshold: 0.0,
+            small_part_clearance: 0.0,
+            small_part_edge_zone: 0.0,
+            merge_cut_paths: false,
+            sheets: vec![
+                SheetOutput {
+                    index: 1,
+                    utilization: 10.0,
+                    used_percent: 10.0,
+                    placements: vec![p_sheet1],
+                },
+                SheetOutput {
+                    index: 2,
+                    utilization: 10.0,
+                    used_percent: 10.0,
+                    placements: vec![p_sheet2],
+                },
+            ],
+            compact_directions: vec!["left".to_string(), "bottom".to_string()],
+            target_sheet_utilization: 90.0,
+            waste_area: 0.0,
+            compact_area: 0.0,
+            last_sheet_compact_area: 0.0,
+            front_load_score: 0.0,
+            alignment_score: 0.0,
+            compact_direction_score: 0.0,
+            target_deficit_score: 0.0,
+            comb_pair_placements: 0,
+            staircase_pattern_placements: 0,
+            priority_zone_fill_placements: 0,
+            pocket_evacuated_sheets: 0,
+            priority_zone_fill_area: 0.0,
+            safety_certified: false,
+            safety_version: 1,
+        };
+
+        // Even with global_rot_div = 4 (free rotation), grain-locked part consolidated from Sheet 2 to Sheet 1
+        // MUST ONLY be rotated 0 or 180 degrees, NEVER 90 or 270!
+        let compact_dirs = vec!["left".to_string(), "bottom".to_string()];
+        consolidate_sheets(&mut layout, 4, false, &compact_dirs);
+
+        assert_eq!(layout.sheets.len(), 1, "Sheet 2 should be consolidated into Sheet 1");
+        for p in &layout.sheets[0].placements {
+            let rot = p.rotation_degrees % 360.0;
+            assert!(
+                (rot - 0.0).abs() < 1e-3 || (rot - 180.0).abs() < 1e-3,
+                "Consolidated placement {} has invalid rotation {}. Grain parts must ONLY be 0 or 180 deg!",
+                p.id,
+                rot
+            );
+        }
+    }
 }

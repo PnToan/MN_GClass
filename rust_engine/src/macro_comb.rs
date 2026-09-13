@@ -101,7 +101,8 @@ pub fn find_best_mating(
 
             let grain_a = part_a.has_grain_label == Some(true) || part_a.grain_locked == Some(true);
             let grain_b = part_b.has_grain_label == Some(true) || part_b.grain_locked == Some(true);
-            if grain_a && grain_b && is_grain_locked {
+            let is_mating_grain_locked = global_grain_locked || grain_a || grain_b;
+            if is_mating_grain_locked {
                 let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
                 let base_b = part_b.base_rotation_degrees.or(part_b.rotation_degrees).unwrap_or(0.0);
                 let diff = (crate::packing::norm_angle(base_a + deg) - crate::packing::norm_angle(base_b)).abs() % 180.0;
@@ -231,12 +232,20 @@ pub fn find_best_mating(
                     continue;
                 }
 
+                let orig_boxes_area = bbox_a.area() + bbox_b.area();
+                let is_compact_saving = orig_boxes_area > 1.0 && box_area <= orig_boxes_area * 0.85;
                 let fill_rate = total_area / box_area;
-                if fill_rate < 0.60 || fill_rate > 1.01 {
+                let min_fill = if is_compact_saving { 0.25 } else { 0.60 };
+                if fill_rate < min_fill || fill_rate > 1.01 {
                     continue;
                 }
 
-                let score = fill_rate * 1000.0 - w.min(h) * 0.1 - box_area * 0.0005;
+                let score = if is_compact_saving {
+                    let saving_ratio = (orig_boxes_area - box_area) / orig_boxes_area;
+                    saving_ratio * 2000.0 + fill_rate * 500.0 - w.min(h) * 0.1
+                } else {
+                    fill_rate * 1000.0 - w.min(h) * 0.1 - box_area * 0.0005
+                };
                 if score > best_score {
                     best_score = score;
                     best_candidate = Some((
@@ -296,9 +305,9 @@ pub fn find_best_mating(
     let poly_b_final = poly_orig_ccw_b
         .rotate_degrees(child_rot_b, origin_zero)
         .translate(child_ox_b, child_oy_b);
-
     let check_spacing = if spacing <= 1e-4 { 0.0 } else { spacing * 0.5 };
-    if polygons_collide_with_spacing(&poly_a_final, &poly_b_final, check_spacing) {
+    let collides_final = polygons_collide_with_spacing(&poly_a_final, &poly_b_final, check_spacing);
+    if collides_final {
         return None;
     }
 
@@ -372,24 +381,23 @@ pub fn try_build_comb_pair(
     let name_b = part_b.name.as_deref().unwrap_or("Part B");
     let area_a = part_a.area.unwrap_or(0.0);
     let area_b = part_b.area.unwrap_or(0.0);
-    let is_grain_locked = config.and_then(|c| c.rotation_divisions).map_or(true, |d| d <= 2)
-        || part_a.grain_locked == Some(true)
-        || part_b.grain_locked == Some(true)
-        || part_a.has_grain_label == Some(true)
-        || part_b.has_grain_label == Some(true);
+    let grain_a = part_a.has_grain_label == Some(true) || part_a.grain_locked == Some(true);
+    let grain_b = part_b.has_grain_label == Some(true) || part_b.grain_locked == Some(true);
+    let global_grain_locked = config.and_then(|c| c.rotation_divisions).map_or(true, |d| d <= 2);
+    let is_grain_locked = global_grain_locked || grain_a || grain_b;
 
-    let (macro_base_rot, ref_grain_arrow) = if part_a.has_grain_label == Some(true) || part_a.grain_locked == Some(true) {
+    let (macro_base_rot, ref_grain_arrow) = if grain_a {
         let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
         let child_rot_a = mating.child_a.rotation_degrees.unwrap_or(0.0);
-        (crate::packing::norm_angle(base_a - child_rot_a), part_a.grain_arrow_degrees.or(Some(0.0)))
-    } else if part_b.has_grain_label == Some(true) || part_b.grain_locked == Some(true) {
+        (crate::packing::norm_angle(base_a - child_rot_a), part_a.grain_arrow_degrees.or(Some(90.0)))
+    } else if grain_b {
         let base_b = part_b.base_rotation_degrees.or(part_b.rotation_degrees).unwrap_or(0.0);
         let child_rot_b = mating.child_b.rotation_degrees.unwrap_or(0.0);
-        (crate::packing::norm_angle(base_b - child_rot_b), part_b.grain_arrow_degrees.or(Some(0.0)))
+        (crate::packing::norm_angle(base_b - child_rot_b), part_b.grain_arrow_degrees.or(Some(90.0)))
     } else {
         let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
         let child_rot_a = mating.child_a.rotation_degrees.unwrap_or(0.0);
-        (crate::packing::norm_angle(base_a - child_rot_a), None)
+        (crate::packing::norm_angle(base_a - child_rot_a), if is_grain_locked { Some(90.0) } else { None })
     };
 
     let macro_part = PartInput {
@@ -424,7 +432,7 @@ pub fn try_build_comb_pair(
         base_rotation_degrees: Some(macro_base_rot),
         rotation_degrees: Some(macro_base_rot),
         grain_locked: Some(is_grain_locked),
-        has_grain_label: Some(is_grain_locked),
+        has_grain_label: Some(grain_a || grain_b),
         grain_arrow_degrees: if is_grain_locked { ref_grain_arrow } else { None },
         free_rotation: Some(!is_grain_locked),
         rotation_divisions: Some(if is_grain_locked { 2 } else { 4 }),
@@ -470,6 +478,7 @@ pub fn create_macro_part(
     part_a: &PartInput,
     part_b: &PartInput,
     offsets: &MatingOffsets,
+    config: Option<&ConfigurationInput>,
 ) -> PartInput {
     let id_a = part_a.id.as_deref().unwrap_or("A");
     let id_b = part_b.id.as_deref().unwrap_or("B");
@@ -525,14 +534,24 @@ pub fn create_macro_part(
         base_rotation_degrees: part_b.base_rotation_degrees,
     };
 
-    let is_grain_locked = part_a.grain_locked == Some(true)
-        || part_b.grain_locked == Some(true)
-        || part_a.has_grain_label == Some(true)
-        || part_b.has_grain_label == Some(true);
+    let grain_a = part_a.has_grain_label == Some(true) || part_a.grain_locked == Some(true);
+    let grain_b = part_b.has_grain_label == Some(true) || part_b.grain_locked == Some(true);
+    let global_grain_locked = config.and_then(|c| c.rotation_divisions).map_or(true, |d| d <= 2);
+    let is_grain_locked = global_grain_locked || grain_a || grain_b;
 
-    let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
-    let child_rot_a = offsets.rot_a;
-    let macro_base_rot = crate::packing::norm_angle(base_a - child_rot_a);
+    let (macro_base_rot, ref_grain_arrow) = if grain_a {
+        let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
+        let child_rot_a = offsets.rot_a;
+        (crate::packing::norm_angle(base_a - child_rot_a), part_a.grain_arrow_degrees.or(Some(90.0)))
+    } else if grain_b {
+        let base_b = part_b.base_rotation_degrees.or(part_b.rotation_degrees).unwrap_or(0.0);
+        let child_rot_b = offsets.rot_b;
+        (crate::packing::norm_angle(base_b - child_rot_b), part_b.grain_arrow_degrees.or(Some(90.0)))
+    } else {
+        let base_a = part_a.base_rotation_degrees.or(part_a.rotation_degrees).unwrap_or(0.0);
+        let child_rot_a = offsets.rot_a;
+        (crate::packing::norm_angle(base_a - child_rot_a), if is_grain_locked { Some(90.0) } else { None })
+    };
 
     PartInput {
         entity_id: Some(format!("comb-macro:{}_{}", id_a, id_b)),
@@ -566,8 +585,8 @@ pub fn create_macro_part(
         base_rotation_degrees: Some(macro_base_rot),
         rotation_degrees: Some(macro_base_rot),
         grain_locked: Some(is_grain_locked),
-        has_grain_label: Some(is_grain_locked),
-        grain_arrow_degrees: if is_grain_locked { part_a.grain_arrow_degrees.or(Some(0.0)) } else { None },
+        has_grain_label: Some(grain_a || grain_b || is_grain_locked),
+        grain_arrow_degrees: if is_grain_locked { ref_grain_arrow } else { None },
         free_rotation: Some(!is_grain_locked),
         rotation_divisions: Some(if is_grain_locked { 2 } else { 4 }),
         color: part_a.color.clone(),
@@ -610,6 +629,7 @@ pub fn pair_comb_parts(
     // Step 1: Pre-filter irregular parts that are candidates for comb pairing
     let mut candidate_indices = Vec::new();
     let mut signatures: Vec<String> = Vec::with_capacity(parts.len());
+    let global_grain_locked = config.rotation_divisions.map_or(true, |d| d <= 2);
 
     for (i, p) in parts.iter().enumerate() {
         if p.manual_cluster_macro == Some(true) {
@@ -625,7 +645,14 @@ pub fn pair_comb_parts(
         let area = p.area.unwrap_or_else(|| poly.area());
         if is_truly_irregular(&poly, &bbox, area) {
             candidate_indices.push(i);
-            signatures.push(compute_shape_signature(p));
+            let is_p_grain = global_grain_locked || p.grain_locked == Some(true) || p.has_grain_label == Some(true);
+            let base_sig = compute_shape_signature(p);
+            if is_p_grain {
+                let g = (p.base_rotation_degrees.or(p.rotation_degrees).unwrap_or(0.0).round() as i64).rem_euclid(180);
+                signatures.push(format!("{}_g{}", base_sig, g));
+            } else {
+                signatures.push(base_sig);
+            }
         } else {
             signatures.push(String::new());
         }
@@ -667,16 +694,41 @@ pub fn pair_comb_parts(
         offsets
     };
 
+    let is_pair_grain_compatible = |idx_a: usize, idx_b: usize, offsets: &MatingOffsets| -> bool {
+        let is_grain = global_grain_locked
+            || parts[idx_a].grain_locked == Some(true)
+            || parts[idx_b].grain_locked == Some(true)
+            || parts[idx_a].has_grain_label == Some(true)
+            || parts[idx_b].has_grain_label == Some(true);
+        if !is_grain {
+            return true;
+        }
+        let base_a = parts[idx_a].base_rotation_degrees.or(parts[idx_a].rotation_degrees).unwrap_or(0.0);
+        let base_b = parts[idx_b].base_rotation_degrees.or(parts[idx_b].rotation_degrees).unwrap_or(0.0);
+        let diff = ((base_a - base_b) - (offsets.rot_a - offsets.rot_b)).round().abs() as i64 % 180;
+        diff == 0
+    };
+
     // Phase 1: Self-mating within identical shape families O(N)
     for (_sig, indices) in groups_by_sig.iter() {
         if indices.len() >= 2 {
             if let Some(offsets) = get_mating(indices[0], indices[1], &mut mating_cache) {
-                if offsets.fill_rate >= 0.65 {
+                let p_a = Polygon::from_raw(&parts[indices[0]].contour);
+                let p_b = Polygon::from_raw(&parts[indices[1]].contour);
+                let orig_boxes_area = p_a.bounding_box().area() + p_b.bounding_box().area();
+                let macro_box = offsets.macro_w * offsets.macro_h;
+                let is_compact_saving = orig_boxes_area > 1.0 && macro_box <= orig_boxes_area * 0.85;
+                let min_threshold = if is_compact_saving { 0.25 } else { 0.65 };
+                if offsets.fill_rate >= min_threshold {
                     let mut i = 0;
                     while i + 1 < indices.len() {
                         let idx_a = indices[i];
                         let idx_b = indices[i + 1];
-                        let macro_p = create_macro_part(&parts[idx_a], &parts[idx_b], &offsets);
+                        if !is_pair_grain_compatible(idx_a, idx_b, &offsets) {
+                            i += 1;
+                            continue;
+                        }
+                        let macro_p = create_macro_part(&parts[idx_a], &parts[idx_b], &offsets, Some(config));
                         macro_parts.push(macro_p);
                         used[idx_a] = true;
                         used[idx_b] = true;
@@ -712,7 +764,13 @@ pub fn pair_comb_parts(
                 let j = sorted_rem[j_pos];
                 if used[j] { continue; }
                 if let Some(offsets) = get_mating(i, j, &mut mating_cache) {
-                    if offsets.fill_rate >= 0.65 {
+                    let p_a = Polygon::from_raw(&parts[i].contour);
+                    let p_b = Polygon::from_raw(&parts[j].contour);
+                    let orig_boxes_area = p_a.bounding_box().area() + p_b.bounding_box().area();
+                    let macro_box = offsets.macro_w * offsets.macro_h;
+                    let is_compact_saving = orig_boxes_area > 1.0 && macro_box <= orig_boxes_area * 0.85;
+                    let min_threshold = if is_compact_saving { 0.25 } else { 0.65 };
+                    if offsets.fill_rate >= min_threshold && is_pair_grain_compatible(i, j, &offsets) {
                         pair_matches.push((i, j, offsets.fill_rate, offsets));
                     }
                 }
@@ -725,7 +783,7 @@ pub fn pair_comb_parts(
             if !used[i] && !used[j] {
                 used[i] = true;
                 used[j] = true;
-                let macro_p = create_macro_part(&parts[i], &parts[j], &offsets);
+                let macro_p = create_macro_part(&parts[i], &parts[j], &offsets, Some(config));
                 macro_parts.push(macro_p);
                 comb_count += 1;
             }
@@ -1031,12 +1089,12 @@ mod tests {
             collision_contour: None,
             collision_holes: None,
             draw_layers: None,
-            rotations: Some(vec![270.0, 90.0]),
-            base_rotation_degrees: Some(270.0),
-            rotation_degrees: Some(270.0),
+            rotations: Some(vec![0.0, 180.0]),
+            base_rotation_degrees: Some(0.0),
+            rotation_degrees: Some(0.0),
             grain_locked: Some(true),
             has_grain_label: Some(true),
-            grain_arrow_degrees: Some(0.0),
+            grain_arrow_degrees: Some(90.0),
             free_rotation: Some(false),
             rotation_divisions: Some(2),
             color: None,
@@ -1070,11 +1128,11 @@ mod tests {
         };
 
         let res = try_build_comb_pair(&part_a, &part_b, 6.0, Some(&config));
-        assert!(res.is_some(), "Trapezoids with length along X and base_rot=270 must mate!");
+        assert!(res.is_some(), "Trapezoids with base_rot=0 must mate!");
         let (macro_p, fill) = res.unwrap();
         assert!(fill >= 0.85);
-        assert_eq!(macro_p.base_rotation_degrees, Some(270.0));
-        assert_eq!(macro_p.rotations, Some(vec![270.0, 90.0]));
+        assert_eq!(macro_p.base_rotation_degrees, Some(0.0));
+        assert_eq!(macro_p.rotations, Some(vec![0.0, 180.0]));
     }
 
     #[test]
@@ -1310,11 +1368,11 @@ mod tests {
             collision_holes: None,
             draw_layers: None,
             rotations: None,
-            base_rotation_degrees: Some(270.0),
-            rotation_degrees: Some(270.0),
+            base_rotation_degrees: Some(0.0),
+            rotation_degrees: Some(0.0),
             grain_locked: Some(true),
             has_grain_label: Some(true),
-            grain_arrow_degrees: Some(0.0),
+            grain_arrow_degrees: Some(90.0),
             free_rotation: Some(false),
             rotation_divisions: None,
             color: None,
@@ -1344,16 +1402,175 @@ mod tests {
 
         let prepared_vg = crate::packing::prepare_parts(&[part.clone()], &config_van_go, 6.0);
         let rots_vg: Vec<f64> = prepared_vg[0].variants.iter().map(|v| v.rotation).collect();
-        // MUST ONLY have 0 deg and 180 deg relative to base_rot (270.0 and 90.0)
-        assert_eq!(rots_vg, vec![270.0, 90.0]);
+        // MUST ONLY have 0 deg and 180 deg relative to base_rot (0.0 and 180.0)
+        assert_eq!(rots_vg, vec![0.0, 180.0]);
 
-        // Case 2: Dropdown "Xoay Tự Do" (rotation_divisions = 4)
+        // Case 2: Dropdown "Xoay Tự Do" (rotation_divisions = 4) nhưng chi tiết CÓ VÂN GỖ
+        // Quy tắc tuyệt đối: chi tiết có vân gỗ VẪN CHỈ ĐƯỢC XOAY 0 và 180 độ (0.0 và 180.0)
         let mut config_tu_do = config_van_go.clone();
         config_tu_do.rotation_divisions = Some(4);
-        let prepared_td = crate::packing::prepare_parts(&[part], &config_tu_do, 6.0);
+        let prepared_td = crate::packing::prepare_parts(&[part.clone()], &config_tu_do, 6.0);
         let rots_td: Vec<f64> = prepared_td[0].variants.iter().map(|v| v.rotation).collect();
-        // MUST have all 4 rotations
-        assert_eq!(rots_td, vec![270.0, 0.0, 90.0, 180.0]);
+        assert_eq!(rots_td, vec![0.0, 180.0]);
+
+        // Case 3: Chi tiết KHÔNG CÓ VÂN GỖ khi chọn "Xoay Tự Do" (rotation_divisions = 4)
+        // Chi tiết không vân gỗ mới được phép xoay cả 4 hướng
+        let mut non_grain_part = part;
+        non_grain_part.has_grain_label = None;
+        non_grain_part.grain_locked = None;
+        let prepared_non_grain = crate::packing::prepare_parts(&[non_grain_part], &config_tu_do, 6.0);
+        let rots_non_grain: Vec<f64> = prepared_non_grain[0].variants.iter().map(|v| v.rotation).collect();
+        assert_eq!(rots_non_grain, vec![0.0, 90.0, 180.0, 270.0]);
+    }
+
+    #[test]
+    fn test_comb_grain_signature_separation_and_macro_lock() {
+        let comb = make_test_comb_contour();
+        let poly = Polygon::from_raw(&comb);
+        let area = poly.area();
+
+        // Part 1: grain along length (base_rotation_degrees = 0.0)
+        let part_0 = PartInput {
+            id: Some("p_0".to_string()),
+            entity_id: Some("ent_0".to_string()),
+            name: Some("Comb 0".to_string()),
+            width: Some(600.0),
+            height: Some(180.0),
+            area: Some(area),
+            contour: comb.clone(),
+            holes: None,
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: Some(vec![0.0, 180.0]),
+            base_rotation_degrees: Some(0.0),
+            rotation_degrees: Some(0.0),
+            grain_locked: Some(true),
+            has_grain_label: Some(true),
+            grain_arrow_degrees: Some(0.0),
+            free_rotation: Some(false),
+            rotation_divisions: Some(2),
+            color: None,
+            logical_part_count: Some(1),
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+        };
+
+        // Part 2: identical shape, but grain along width (base_rotation_degrees = 90.0)
+        let mut part_90 = part_0.clone();
+        part_90.id = Some("p_90".to_string());
+        part_90.entity_id = Some("ent_90".to_string());
+        part_90.base_rotation_degrees = Some(90.0);
+        part_90.rotation_degrees = Some(90.0);
+        part_90.rotations = Some(vec![90.0, 270.0]);
+
+        let config = ConfigurationInput {
+            board_width: Some(2440.0),
+            board_height: Some(1220.0),
+            edge_margin: Some(10.0),
+            cut_gap: Some(6.0),
+            part_spacing: Some(6.0),
+            rotation_divisions: Some(2),
+            rotate_step: Some(180.0),
+            compact_directions: Some(vec!["left".to_string(), "bottom".to_string()]),
+            target_sheet_utilization: Some(90.0),
+            sheet_in_sheet: Some(false),
+            selective_repack: Some(false),
+            small_part_threshold: Some(0.0),
+            small_part_clearance: Some(0.0),
+            small_part_edge_zone: Some(0.0),
+            merge_cut_paths: Some(false),
+        };
+
+        // Pairing part_0 and part_90 must NOT pair because their grains are perpendicular!
+        let (paired_incompatible, count_incompatible) = pair_comb_parts(&[part_0.clone(), part_90.clone()], &config, 6.0);
+        assert_eq!(count_incompatible, 0, "Perpendicular grain parts must NOT be paired together!");
+        assert_eq!(paired_incompatible.len(), 2);
+
+        // Pairing two part_0 parts MUST succeed and result in a grain-locked macro with rotations [0, 180]
+        let mut part_0_b = part_0.clone();
+        part_0_b.id = Some("p_0_b".to_string());
+        part_0_b.entity_id = Some("ent_0_b".to_string());
+        let (paired_ok, count_ok) = pair_comb_parts(&[part_0.clone(), part_0_b], &config, 6.0);
+        assert_eq!(count_ok, 1, "Compatible grain parts must be paired");
+        let macro_part = &paired_ok[0];
+        assert_eq!(macro_part.grain_locked, Some(true));
+        assert_eq!(macro_part.base_rotation_degrees, Some(0.0));
+        assert_eq!(macro_part.rotations, Some(vec![0.0, 180.0]));
+
+        // Check prepare_parts on this macro: must strictly allow ONLY 0.0 and 180.0
+        let prepared = crate::packing::prepare_parts(&[macro_part.clone()], &config, 6.0);
+        let rots: Vec<f64> = prepared[0].variants.iter().map(|v| v.rotation).collect();
+        assert_eq!(rots, vec![0.0, 180.0], "Macro must ONLY rotate 0 and 180 deg along sheet length");
+    }
+
+    #[test]
+    fn test_002_corner_mating() {
+        let contour = vec![
+            [210.0, 185.0], [210.0, 400.0], [0.0, 400.0], [0.0, 165.772],
+            [1.418, 144.134], [5.648, 122.867], [12.618, 102.334], [22.209, 82.886],
+            [34.256, 64.857], [48.553, 48.554], [64.856, 34.256], [82.886, 22.209],
+            [102.333, 12.619], [122.867, 5.649], [144.134, 1.418], [165.771, 0.0],
+            [400.0, 0.0], [400.0, 185.0]
+        ];
+        let part_a = PartInput {
+            id: Some("002_1".to_string()),
+            entity_id: Some("ent_1".to_string()),
+            name: Some("002_Group 1".to_string()),
+            width: Some(400.0),
+            height: Some(400.0),
+            area: Some(113191.12),
+            contour: contour.clone(),
+            holes: None,
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: Some(vec![0.0, 180.0]),
+            base_rotation_degrees: Some(0.0),
+            rotation_degrees: Some(0.0),
+            grain_locked: Some(true),
+            has_grain_label: Some(true),
+            grain_arrow_degrees: Some(90.0),
+            free_rotation: Some(false),
+            rotation_divisions: Some(2),
+            color: None,
+            logical_part_count: Some(1),
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+        };
+        let part_b = PartInput {
+            id: Some("002_2".to_string()),
+            entity_id: Some("ent_2".to_string()),
+            name: Some("002_Group 2".to_string()),
+            ..part_a.clone()
+        };
+        let config = ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            cut_gap: Some(6.0),
+            part_spacing: Some(6.0),
+            rotation_divisions: Some(2),
+            rotate_step: Some(180.0),
+            compact_directions: Some(vec!["left".to_string(), "bottom".to_string()]),
+            target_sheet_utilization: Some(90.0),
+            sheet_in_sheet: Some(false),
+            selective_repack: Some(false),
+            small_part_threshold: Some(0.0),
+            small_part_clearance: Some(0.0),
+            small_part_edge_zone: Some(0.0),
+            merge_cut_paths: Some(false),
+        };
+        let res = try_build_comb_pair(&part_a, &part_b, 6.0, Some(&config));
+        assert!(res.is_some(), "002_Group corner parts must be successfully comb mated");
+        let (macro_p, fill) = res.unwrap();
+        assert!(fill > 0.85, "Fill rate should be high (>85%), got {}", fill);
+        assert_eq!(macro_p.manual_cluster_macro, Some(true));
+        assert_eq!(macro_p.manual_cluster_children.as_ref().map(|c| c.len()), Some(2));
     }
 }
 
