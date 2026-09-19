@@ -691,6 +691,7 @@ mod tests {
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
                 two_sided: None,
+                has_circular_arc: None,
             });
         }
         let config = crate::types::ConfigurationInput {
@@ -773,6 +774,7 @@ mod tests {
             manual_cluster_macro: None,
             manual_cluster_children: None,
             two_sided: None,
+            has_circular_arc: None,
         };
         let config = crate::types::ConfigurationInput {
             board_width: Some(1220.0),
@@ -820,6 +822,7 @@ mod tests {
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
                 two_sided: None,
+                has_circular_arc: None,
             });
         }
         // 10 right triangles (400 x 400)
@@ -852,6 +855,7 @@ mod tests {
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
                 two_sided: None,
+                has_circular_arc: None,
             });
         }
 

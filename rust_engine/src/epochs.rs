@@ -82,13 +82,15 @@ pub fn consolidate_sheets(
                 let poly = Polygon::from_raw(&p.contour);
                 let p_area = p.area;
                 let curr_rot = p.rotation_degrees;
+                let has_direct_grain = p.has_grain_label == Some(true)
+                    || p.grain_locked == Some(true)
+                    || p.grain_arrow_degrees.is_some();
                 let is_grain = (global_rot_div <= 2)
-                    || (p.has_grain_label == Some(true))
-                    || (p.grain_locked == Some(true))
+                    || has_direct_grain
                     || (p.manual_cluster_macro == Some(true));
 
                 let allowed_rotations = if is_grain {
-                    if global_rot_div == 1 && p.has_grain_label != Some(true) && p.grain_locked != Some(true) {
+                    if global_rot_div == 1 && !has_direct_grain {
                         vec![0.0]
                     } else {
                         vec![0.0, 180.0]
@@ -106,6 +108,14 @@ pub fn consolidate_sheets(
                     let ctx = &mut contexts[target_idx];
 
                     for &delta_rot in &allowed_rotations {
+                        let new_rot = norm_angle(curr_rot + delta_rot);
+                        if is_grain {
+                            let base_rot = norm_angle(p.base_rotation_degrees.unwrap_or(0.0));
+                            let diff = (new_rot - base_rot).abs() % 180.0;
+                            if diff > 2.0 && diff < 178.0 {
+                                continue;
+                            }
+                        }
                         let rotated = poly.rotate_degrees(delta_rot, Point::new(0.0, 0.0));
                         let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
                         let bbox = norm_poly.bounding_box();
@@ -129,7 +139,6 @@ pub fn consolidate_sheets(
                             p.small_part_clearance.unwrap_or(0.0),
                             1.0,
                         ) {
-                            let new_rot = norm_angle(curr_rot + delta_rot);
                             ctx.add_placed(
                                 norm_poly.clone(),
                                 norm_holes.clone(),
@@ -449,4 +458,90 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_triangle_grain_never_rotated_270_or_90() {
+        use crate::types::{MaterialStateInput, ConfigurationInput, PartInput};
+        let tri_contour = vec![
+            [0.0, 0.0],
+            [600.0, 0.0],
+            [0.0, 400.0],
+        ];
+        let poly = Polygon::from_raw(&tri_contour);
+        let area = poly.area();
+
+        let make_tri = |id: &str| PartInput {
+            id: Some(id.to_string()),
+            entity_id: Some(format!("ent_{}", id)),
+            name: Some(format!("Triangle {}", id)),
+            width: Some(600.0),
+            height: Some(400.0),
+            area: Some(area),
+            contour: tri_contour.clone(),
+            holes: None,
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: None,
+            base_rotation_degrees: Some(0.0),
+            rotation_degrees: Some(0.0),
+            grain_locked: Some(true),
+            has_grain_label: Some(true),
+            grain_arrow_degrees: Some(0.0),
+            free_rotation: Some(false),
+            rotation_divisions: Some(2),
+            color: None,
+            logical_part_count: Some(1),
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+            two_sided: None,
+            has_circular_arc: None,
+        };
+
+        // Even with global configuration rotation_divisions = 4 (free 4-direction rotation)
+        let config = ConfigurationInput {
+            board_width: Some(2440.0),
+            board_height: Some(1220.0),
+            edge_margin: Some(10.0),
+            cut_gap: Some(6.0),
+            part_spacing: Some(6.0),
+            rotation_divisions: Some(4),
+            rotate_step: Some(90.0),
+            compact_directions: Some(vec!["left".to_string(), "bottom".to_string()]),
+            target_sheet_utilization: Some(90.0),
+            sheet_in_sheet: Some(false),
+            selective_repack: Some(false),
+            small_part_threshold: Some(0.0),
+            small_part_clearance: Some(0.0),
+            small_part_edge_zone: Some(0.0),
+            merge_cut_paths: Some(false),
+        };
+
+        let mat_state = MaterialStateInput {
+            key: Some("mdf|18".to_string()),
+            material: Some("MDF".to_string()),
+            thickness: Some(18.0),
+            group_index: Some(0),
+            configuration: Some(config),
+            original_part_count: Some(2),
+            parts: vec![make_tri("1"), make_tri("2")],
+            learning_key: None,
+        };
+
+        let layout = optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});
+        for sheet in &layout.sheets {
+            for p in &sheet.placements {
+                let rot = p.rotation_degrees.rem_euclid(360.0);
+                assert!(
+                    (rot - 0.0).abs() < 1e-2 || (rot - 180.0).abs() < 1e-2,
+                    "Placement {} rotated by {:.1} degrees! Grain direction violation: must only be 0 or 180 deg.",
+                    p.id,
+                    rot
+                );
+            }
+        }
+    }
 }
+

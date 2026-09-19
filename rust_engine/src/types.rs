@@ -126,6 +126,8 @@ pub struct PartInput {
     pub manual_cluster_children: Option<Vec<ClusterChild>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub two_sided: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_circular_arc: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

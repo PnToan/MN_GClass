@@ -112,9 +112,11 @@ pub fn prepare_parts(
         let has_child_grain = p.manual_cluster_macro == Some(true) && p.manual_cluster_children.as_ref().map_or(false, |children| {
             children.iter().any(|c| c.has_grain_label == Some(true) || c.grain_arrow_degrees.is_some() || c.base_rotation_degrees.is_some())
         });
+        let has_direct_grain = p.has_grain_label == Some(true)
+            || p.grain_locked == Some(true)
+            || p.grain_arrow_degrees.is_some();
         let is_part_grain_locked = (global_rot_div <= 2)
-            || (p.grain_locked == Some(true))
-            || (p.has_grain_label == Some(true))
+            || has_direct_grain
             || has_child_grain;
         let base_rot = norm_angle(p.base_rotation_degrees.or(p.rotation_degrees).unwrap_or(0.0));
 
@@ -350,12 +352,9 @@ where
     };
     let compact_directions = config.compact_directions.clone().unwrap_or_else(|| vec!["left".to_string(), "bottom".to_string()]);
 
-    let (paired_parts, comb_count) = if material_state.parts.iter().any(|p| p.manual_cluster_macro == Some(true)) {
-        let count = material_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
-        (material_state.parts.clone(), count)
-    } else {
-        crate::macro_comb::pair_comb_parts(&material_state.parts, &config, part_spacing)
-    };
+    let (paired_parts, new_comb_count) = crate::macro_comb::pair_comb_parts(&material_state.parts, &config, part_spacing);
+    let existing_macro_count = material_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
+    let comb_count = existing_macro_count + new_comb_count;
     let processed = prepare_parts(&paired_parts, &config, part_spacing);
 
     // Section IV: Multi-tier Priority Queue Ordering
