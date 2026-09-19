@@ -334,6 +334,8 @@ pub fn find_best_mating(
         has_grain_label: part_a.has_grain_label,
         grain_arrow_degrees: part_a.grain_arrow_degrees,
         base_rotation_degrees: part_a.base_rotation_degrees,
+        two_sided: part_a.two_sided,
+        manual_cluster_child: None,
     };
 
     let child_b = ClusterChild {
@@ -357,6 +359,8 @@ pub fn find_best_mating(
         has_grain_label: part_b.has_grain_label,
         grain_arrow_degrees: part_b.grain_arrow_degrees,
         base_rotation_degrees: part_b.base_rotation_degrees,
+        two_sided: part_b.two_sided,
+        manual_cluster_child: None,
     };
 
     Some(CombMatingResult {
@@ -440,6 +444,7 @@ pub fn try_build_comb_pair(
         logical_part_count: Some(2),
         manual_cluster_macro: Some(true),
         manual_cluster_children: Some(vec![mating.child_a, mating.child_b]),
+        two_sided: Some(part_a.two_sided == Some(true) || part_b.two_sided == Some(true)),
     };
 
     Some((macro_part, mating.fill_rate))
@@ -509,6 +514,8 @@ pub fn create_macro_part(
         has_grain_label: part_a.has_grain_label,
         grain_arrow_degrees: part_a.grain_arrow_degrees,
         base_rotation_degrees: part_a.base_rotation_degrees,
+        two_sided: part_a.two_sided,
+        manual_cluster_child: None,
     };
 
     let child_b = ClusterChild {
@@ -532,6 +539,8 @@ pub fn create_macro_part(
         has_grain_label: part_b.has_grain_label,
         grain_arrow_degrees: part_b.grain_arrow_degrees,
         base_rotation_degrees: part_b.base_rotation_degrees,
+        two_sided: part_b.two_sided,
+        manual_cluster_child: None,
     };
 
     let grain_a = part_a.has_grain_label == Some(true) || part_a.grain_locked == Some(true);
@@ -593,6 +602,7 @@ pub fn create_macro_part(
         logical_part_count: Some(2),
         manual_cluster_macro: Some(true),
         manual_cluster_children: Some(vec![child_a, child_b]),
+        two_sided: Some(part_a.two_sided == Some(true) || part_b.two_sided == Some(true)),
     }
 }
 
@@ -740,55 +750,7 @@ pub fn pair_comb_parts(
         }
     }
 
-    // Phase 2: Cross-family mating among remaining candidates
-    let remaining_candidates: Vec<usize> = candidate_indices
-        .into_iter()
-        .filter(|&idx| !used[idx])
-        .collect();
-
-    if remaining_candidates.len() >= 2 {
-        let mut pair_matches: Vec<(usize, usize, f64, MatingOffsets)> = Vec::new();
-        let mut sorted_rem = remaining_candidates.clone();
-        sorted_rem.sort_by(|&a, &b| {
-            let area_a = parts[a].area.unwrap_or(0.0);
-            let area_b = parts[b].area.unwrap_or(0.0);
-            area_b.partial_cmp(&area_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let window = 40.min(sorted_rem.len());
-        for i_pos in 0..sorted_rem.len() {
-            let i = sorted_rem[i_pos];
-            if used[i] { continue; }
-            let max_j = (i_pos + window).min(sorted_rem.len());
-            for j_pos in (i_pos + 1)..max_j {
-                let j = sorted_rem[j_pos];
-                if used[j] { continue; }
-                if let Some(offsets) = get_mating(i, j, &mut mating_cache) {
-                    let p_a = Polygon::from_raw(&parts[i].contour);
-                    let p_b = Polygon::from_raw(&parts[j].contour);
-                    let orig_boxes_area = p_a.bounding_box().area() + p_b.bounding_box().area();
-                    let macro_box = offsets.macro_w * offsets.macro_h;
-                    let is_compact_saving = orig_boxes_area > 1.0 && macro_box <= orig_boxes_area * 0.85;
-                    let min_threshold = if is_compact_saving { 0.25 } else { 0.65 };
-                    if offsets.fill_rate >= min_threshold && is_pair_grain_compatible(i, j, &offsets) {
-                        pair_matches.push((i, j, offsets.fill_rate, offsets));
-                    }
-                }
-            }
-        }
-
-        pair_matches.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-        for (i, j, _, offsets) in pair_matches {
-            if !used[i] && !used[j] {
-                used[i] = true;
-                used[j] = true;
-                let macro_p = create_macro_part(&parts[i], &parts[j], &offsets, Some(config));
-                macro_parts.push(macro_p);
-                comb_count += 1;
-            }
-        }
-    }
+    // Phase 2: Cross-family mating disabled. Only identical curved shapes are paired.
 
     // Step 4: Assemble final parts list
     let mut result = Vec::with_capacity(parts.len());
@@ -880,6 +842,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
 
         let part_b = PartInput {
@@ -908,6 +871,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
 
         let res = try_build_comb_pair(&part_a, &part_b, 6.0, None);
@@ -978,6 +942,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
 
         let part_b = part_a.clone();
@@ -1024,6 +989,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
         let part_b = PartInput {
             id: Some("trap_2".to_string()),
@@ -1101,6 +1067,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
         let part_b = PartInput {
             id: Some("trap_x2".to_string()),
@@ -1169,6 +1136,7 @@ mod tests {
                 logical_part_count: Some(1),
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
+                two_sided: None,
             });
         }
 
@@ -1233,6 +1201,7 @@ mod tests {
                 logical_part_count: Some(1),
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
+                two_sided: None,
             });
         }
 
@@ -1295,6 +1264,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
         let part_b = part_a.clone();
 
@@ -1379,6 +1349,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
 
         // Case 1: Dropdown "Vân Gỗ" (rotation_divisions = 1)
@@ -1456,6 +1427,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
 
         // Part 2: identical shape, but grain along width (base_rotation_degrees = 90.0)
@@ -1541,6 +1513,7 @@ mod tests {
             logical_part_count: Some(1),
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
         let part_b = PartInput {
             id: Some("002_2".to_string()),

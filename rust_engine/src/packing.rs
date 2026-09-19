@@ -101,7 +101,10 @@ pub fn prepare_parts(
             0.0
         };
         let size_group = SizeGroup::from_dimensions(orig_bbox.width(), orig_bbox.height());
-        let is_two_sided = false;
+        let is_two_sided = p.two_sided.unwrap_or(false)
+            || (p.manual_cluster_macro == Some(true) && p.manual_cluster_children.as_ref().map_or(false, |children| {
+                children.iter().any(|c| c.two_sided == Some(true))
+            }));
         let is_anchor = p.holes.as_ref().map_or(false, |h| !h.is_empty()) || !poly.is_rectangular();
         let is_irregular = !poly.is_rectangular();
         let is_rect = poly.is_rectangular() && p.holes.as_ref().map_or(true, |h| h.is_empty());
@@ -443,6 +446,7 @@ where
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
                 let b_cluster = b.original.manual_cluster_macro == Some(true);
                 if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
                 if a.is_rect != b.is_rect { return b.is_rect.cmp(&a.is_rect); }
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -452,6 +456,7 @@ where
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
                 let b_cluster = b.original.manual_cluster_macro == Some(true);
                 if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
                 if a.is_irregular != b.is_irregular { return b.is_irregular.cmp(&a.is_irregular); }
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -464,7 +469,8 @@ where
         if n > 1 {
             for i in 0..n {
                 let j = (seed.wrapping_add((i * 31) as u64) as usize) % n;
-                if (ordered_parts[i].area - ordered_parts[j].area).abs() / ordered_parts[i].area.max(1.0) < 0.15 {
+                if ordered_parts[i].is_two_sided == ordered_parts[j].is_two_sided
+                    && (ordered_parts[i].area - ordered_parts[j].area).abs() / ordered_parts[i].area.max(1.0) < 0.15 {
                     ordered_parts.swap(i, j);
                 }
             }
@@ -534,7 +540,7 @@ where
                 contour: variant.norm_poly.to_raw(),
                 holes: if variant.norm_holes.is_empty() { None } else { Some(variant.norm_holes.iter().map(|h| h.to_raw()).collect()) },
                 draw_layers: if variant.norm_layers.is_empty() { None } else { Some(variant.norm_layers.clone()) },
-                color: part.original.color.clone(),
+                color: if part.is_two_sided { Some("#CC99FF".to_string()) } else { part.original.color.clone() },
                 manual_cluster_macro: part.original.manual_cluster_macro,
                 manual_cluster_children: part.original.manual_cluster_children.clone(),
                 logical_part_count: part.original.logical_part_count,
@@ -550,6 +556,7 @@ where
                     variant.bbox.width(),
                     variant.bbox.height(),
                 )),
+                two_sided: Some(part.is_two_sided),
             };
 
             sheet_placements[sheet_idx].push(placement);
@@ -611,7 +618,7 @@ where
                 contour: variant.norm_poly.to_raw(),
                 holes: if variant.norm_holes.is_empty() { None } else { Some(variant.norm_holes.iter().map(|h| h.to_raw()).collect()) },
                 draw_layers: if variant.norm_layers.is_empty() { None } else { Some(variant.norm_layers.clone()) },
-                color: part.original.color.clone(),
+                color: if part.is_two_sided { Some("#CC99FF".to_string()) } else { part.original.color.clone() },
                 manual_cluster_macro: part.original.manual_cluster_macro,
                 manual_cluster_children: part.original.manual_cluster_children.clone(),
                 logical_part_count: part.original.logical_part_count,
@@ -627,6 +634,7 @@ where
                     variant.bbox.width(),
                     variant.bbox.height(),
                 )),
+                two_sided: Some(part.is_two_sided),
             };
 
             sheet_placements[sheet_idx].push(placement);

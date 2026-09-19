@@ -4,7 +4,7 @@ use crate::geometry::{Point, Polygon};
 use crate::nfp::SheetContext;
 use crate::packing::{pack_material, pack_material_streaming, norm_angle};
 use crate::scoring::LayoutScore;
-use crate::types::{LayoutOutput, MaterialStateInput};
+use crate::types::{LayoutOutput, MaterialStateInput, SheetOutput};
 
 pub fn consolidate_sheets(
     layout: &mut LayoutOutput,
@@ -226,6 +226,25 @@ pub fn consolidate_sheets(
     changed
 }
 
+fn prioritize_two_sided_sheets(sheets: &mut Vec<SheetOutput>) {
+    sheets.sort_by(|a, b| {
+        let a_2s = a.placements.iter().any(|p| p.two_sided == Some(true));
+        let b_2s = b.placements.iter().any(|p| p.two_sided == Some(true));
+        if a_2s != b_2s {
+            return b_2s.cmp(&a_2s);
+        }
+        let a_count = a.placements.iter().filter(|p| p.two_sided == Some(true)).count();
+        let b_count = b.placements.iter().filter(|p| p.two_sided == Some(true)).count();
+        if a_count != b_count {
+            return b_count.cmp(&a_count);
+        }
+        a.index.cmp(&b.index)
+    });
+    for (i, sheet) in sheets.iter_mut().enumerate() {
+        sheet.index = i + 1;
+    }
+}
+
 pub fn optimize_material_layout<F>(
     material_state: &MaterialStateInput,
     mut on_progress: F,
@@ -250,6 +269,7 @@ where
     let mut paired_material_state = material_state.clone();
     paired_material_state.parts = paired_parts;
     let total_parts = paired_material_state.parts.len();
+    let start_mat = std::time::Instant::now();
 
     // 1. Initial baseline with progressive sheet-by-sheet live streaming
     let mut progressive_sheet = 0;
@@ -269,36 +289,48 @@ where
     );
 
     consolidate_sheets(&mut initial_layout, global_rot_div, sheet_in_sheet, &compact_directions);
+    prioritize_two_sided_sheets(&mut initial_layout.sheets);
     on_progress("Tối ưu sơ bộ", 60.0, initial_layout.sheets.len(), 0, &initial_layout);
     let mut best_layout = initial_layout;
 
-    // 2. Parallel multi-strategy exploration (bounded 4-8 strategies for high speed)
+    // 2. Parallel multi-strategy exploration (bounded for 10s response time rule)
+    let baseline_elapsed = start_mat.elapsed().as_secs_f64();
     let num_threads = rayon::current_num_threads();
-    let num_strategies = num_threads.clamp(4, 8);
+    let num_strategies = if baseline_elapsed > 4.0 {
+        2.min(num_threads)
+    } else {
+        num_threads.clamp(3, 6)
+    };
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    (1..=num_strategies).into_par_iter().for_each_with(tx, |s, strategy_id| {
-        let mut layout = pack_material(&paired_material_state, strategy_id);
-        consolidate_sheets(&mut layout, global_rot_div, sheet_in_sheet, &compact_directions);
-        let _ = s.send((strategy_id, layout));
-    });
+    if num_strategies > 0 && baseline_elapsed < 8.0 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (1..=num_strategies).into_par_iter().for_each_with(tx, |s, strategy_id| {
+            let mut layout = pack_material(&paired_material_state, strategy_id);
+            consolidate_sheets(&mut layout, global_rot_div, sheet_in_sheet, &compact_directions);
+            let _ = s.send((strategy_id, layout));
+        });
 
-    let mut completed_count = 0;
-    while let Ok((_strat_id, layout)) = rx.recv() {
-        completed_count += 1;
-        let score_cand = LayoutScore::compute(&layout);
-        let score_best = LayoutScore::compute(&best_layout);
-        let strategy_pct = 60.0 + (completed_count as f64 / num_strategies as f64) * 35.0;
-        if score_cand < score_best {
-            best_layout = layout;
+        let mut completed_count = 0;
+        while let Ok((_strat_id, mut layout)) = rx.recv() {
+            completed_count += 1;
+            prioritize_two_sided_sheets(&mut layout.sheets);
+            let score_cand = LayoutScore::compute(&layout);
+            let score_best = LayoutScore::compute(&best_layout);
+            let strategy_pct = 60.0 + (completed_count as f64 / num_strategies as f64) * 35.0;
+            if score_cand < score_best {
+                best_layout = layout;
+            }
             on_progress("Tối ưu đa luồng", strategy_pct, completed_count, num_strategies, &best_layout);
-        } else {
-            on_progress("Tối ưu đa luồng", strategy_pct, completed_count, num_strategies, &best_layout);
+
+            if start_mat.elapsed().as_secs_f64() >= 9.5 {
+                break;
+            }
         }
     }
 
     // 3. Final consolidation & scoring
     consolidate_sheets(&mut best_layout, global_rot_div, sheet_in_sheet, &compact_directions);
+    prioritize_two_sided_sheets(&mut best_layout.sheets);
 
     let final_score = LayoutScore::compute(&best_layout);
     best_layout.waste_area = final_score.waste_area;
@@ -350,6 +382,7 @@ mod tests {
             small_part: Some(false),
             small_part_clearance: Some(0.0),
             small_part_edge_protected: Some(false),
+            two_sided: None,
         };
 
         let mut p_sheet2 = p_sheet1.clone();

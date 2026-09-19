@@ -70,6 +70,10 @@ pub struct ClusterChild {
     pub grain_arrow_degrees: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_rotation_degrees: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_sided: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_cluster_child: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -120,6 +124,8 @@ pub struct PartInput {
     pub logical_part_count: Option<usize>,
     pub manual_cluster_macro: Option<bool>,
     pub manual_cluster_children: Option<Vec<ClusterChild>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_sided: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,4 +225,6 @@ pub struct PlacementOutput {
     pub small_part: Option<bool>,
     pub small_part_clearance: Option<f64>,
     pub small_part_edge_protected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_sided: Option<bool>,
 }

@@ -690,6 +690,7 @@ mod tests {
                 logical_part_count: None,
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
+                two_sided: None,
             });
         }
         let config = crate::types::ConfigurationInput {
@@ -771,6 +772,7 @@ mod tests {
             logical_part_count: None,
             manual_cluster_macro: None,
             manual_cluster_children: None,
+            two_sided: None,
         };
         let config = crate::types::ConfigurationInput {
             board_width: Some(1220.0),
@@ -817,6 +819,7 @@ mod tests {
                 logical_part_count: None,
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
+                two_sided: None,
             });
         }
         // 10 right triangles (400 x 400)
@@ -848,6 +851,7 @@ mod tests {
                 logical_part_count: None,
                 manual_cluster_macro: None,
                 manual_cluster_children: None,
+                two_sided: None,
             });
         }
 

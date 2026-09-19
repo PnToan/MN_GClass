@@ -168,7 +168,11 @@ fn main() {
 
     let elapsed = start_time.elapsed().as_secs_f64();
     let total_sheets: usize = current_layouts.iter().map(|l| l.sheets.len()).sum();
-    let total_parts: usize = current_layouts.iter().map(|l| l.sheets.iter().map(|s| s.placements.len()).sum::<usize>()).sum();
+    let total_parts: usize = current_layouts.iter().map(|l| {
+        l.sheets.iter().map(|s| {
+            s.placements.iter().map(|p| p.logical_part_count.unwrap_or(1)).sum::<usize>()
+        }).sum::<usize>()
+    }).sum();
 
     let time_str = if elapsed >= 60.0 {
         let m = (elapsed / 60.0).floor() as u64;
@@ -179,7 +183,7 @@ fn main() {
     };
 
     let final_message = format!(
-        "Nesting hoàn thành bằng Rust Engine: {} tấm, {} chi tiết trong {}.",
+        "Nesting hoàn thành: {} tấm, {} chi tiết trong {}.",
         total_sheets,
         total_parts,
         time_str
