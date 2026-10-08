@@ -115,9 +115,12 @@ pub fn prepare_parts(
         let has_direct_grain = p.has_grain_label == Some(true)
             || p.grain_locked == Some(true)
             || p.grain_arrow_degrees.is_some();
-        let is_part_grain_locked = (global_rot_div <= 2)
-            || has_direct_grain
-            || has_child_grain;
+        let is_free_rot = p.free_rotation == Some(true) || global_rot_div >= 4;
+        let is_part_grain_locked = if is_free_rot {
+            false
+        } else {
+            (global_rot_div <= 2) || has_direct_grain || has_child_grain
+        };
         let base_rot = norm_angle(p.base_rotation_degrees.or(p.rotation_degrees).unwrap_or(0.0));
 
         let mut allowed_rotations: Vec<f64> = if is_part_grain_locked {
@@ -329,6 +332,7 @@ where
         target_sheet_utilization: Some(90.0),
         sheet_in_sheet: Some(false),
         selective_repack: Some(false),
+        optimization_seed: None,
         small_part_threshold: Some(0.0),
         small_part_clearance: Some(0.0),
         small_part_edge_zone: Some(0.0),
@@ -375,8 +379,13 @@ where
         _ => 0.8,
     };
 
+    let opt_seed = config.optimization_seed
+        .or(material_state.optimization_seed)
+        .unwrap_or(0);
+    let seed_base = opt_seed.wrapping_add((strategy_id as u64).wrapping_mul(6364136223846793005));
+
     let mut ordered_parts = processed;
-    match strategy_id % 7 {
+    match strategy_id % 10 {
         0 => {
             ordered_parts.sort_by(|a, b| {
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
@@ -450,6 +459,47 @@ where
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
+        6 => {
+            // Sắp diện tích tăng dần (Smallest first) - chi tiết nhỏ lấp hốc trước
+            ordered_parts.sort_by(|a, b| {
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                a.area.partial_cmp(&b.area).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        7 => {
+            // Aspect ratio giảm dần (thanh dài trước)
+            ordered_parts.sort_by(|a, b| {
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                let ar_a = (a.variants[0].bbox.width().max(a.variants[0].bbox.height())) / (a.variants[0].bbox.width().min(a.variants[0].bbox.height()).max(1.0));
+                let ar_b = (b.variants[0].bbox.width().max(b.variants[0].bbox.height())) / (b.variants[0].bbox.width().min(b.variants[0].bbox.height()).max(1.0));
+                ar_b.partial_cmp(&ar_a).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal))
+            });
+        }
+        8 => {
+            // Interleaved: xen kẽ lớn nhất và nhỏ nhất
+            ordered_parts.sort_by(|a, b| {
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let n = ordered_parts.len();
+            if n > 2 {
+                let mut interleaved = Vec::with_capacity(n);
+                let mut l = 0;
+                let mut r = n - 1;
+                while l <= r {
+                    if l == r {
+                        interleaved.push(ordered_parts[l].clone());
+                        break;
+                    }
+                    interleaved.push(ordered_parts[l].clone());
+                    interleaved.push(ordered_parts[r].clone());
+                    l += 1;
+                    r -= 1;
+                }
+                ordered_parts = interleaved;
+            }
+        }
         _ => {
             ordered_parts.sort_by(|a, b| {
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
@@ -462,14 +512,15 @@ where
         }
     }
 
-    if strategy_id >= 7 {
-        let seed = (strategy_id as u64).wrapping_mul(104729).wrapping_add(17);
+    if strategy_id >= 10 || (opt_seed > 0 && strategy_id >= 2) {
+        let mut rng_state = seed_base.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let n = ordered_parts.len();
         if n > 1 {
-            for i in 0..n {
-                let j = (seed.wrapping_add((i * 31) as u64) as usize) % n;
-                if ordered_parts[i].is_two_sided == ordered_parts[j].is_two_sided
-                    && (ordered_parts[i].area - ordered_parts[j].area).abs() / ordered_parts[i].area.max(1.0) < 0.15 {
+            for i in (1..n).rev() {
+                if ordered_parts[i].is_two_sided { continue; }
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = ((rng_state >> 32) as usize) % (i + 1);
+                if !ordered_parts[j].is_two_sided {
                     ordered_parts.swap(i, j);
                 }
             }
@@ -546,6 +597,7 @@ where
                 has_grain_label: if part.is_grain_locked { Some(true) } else { part.original.has_grain_label },
                 grain_arrow_degrees: part.original.grain_arrow_degrees,
                 grain_locked: Some(part.is_grain_locked),
+                free_rotation: part.original.free_rotation,
                 small_part: Some(part.small_part),
                 small_part_clearance: Some(part.small_part_clearance),
                 small_part_edge_protected: Some(sheet.small_part_edge_protected(
@@ -567,6 +619,12 @@ where
 
     // Helper closure to try placing a part onto a SINGLE sheet
     let try_place_on_single_sheet = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>]| -> bool {
+        if sheet_in_sheet && sheets[sheet_idx].has_holes() {
+            if try_place_in_single_sheet_holes(part, sheet_idx, sheets, sheet_placements) {
+                return true;
+            }
+        }
+
         let sheet = &mut sheets[sheet_idx];
         let mut best_variant = None;
         let mut best_pt = None;
@@ -624,6 +682,7 @@ where
                 has_grain_label: if part.is_grain_locked { Some(true) } else { part.original.has_grain_label },
                 grain_arrow_degrees: part.original.grain_arrow_degrees,
                 grain_locked: Some(part.is_grain_locked),
+                free_rotation: part.original.free_rotation,
                 small_part: Some(part.small_part),
                 small_part_clearance: Some(part.small_part_clearance),
                 small_part_edge_protected: Some(sheet.small_part_edge_protected(
@@ -669,11 +728,10 @@ where
             pass_count += 1;
             let mut placed_in_this_pass = false;
 
-            // Bước A: Ưu tiên nhét chi tiết hình vuông / chữ nhật vào các hốc rỗng trên tấm này
+            // Bước A: Ưu tiên nhét chi tiết vào các hốc rỗng trên tấm này
             for i in 0..total_parts {
                 if placed_flags[i] { continue; }
                 let part = &ordered_parts[i];
-                if !part.is_rect { continue; }
 
                 if try_place_in_single_sheet_holes(part, current_sheet_idx, &mut sheets, &mut sheet_placements) {
                     placed_flags[i] = true;

@@ -85,9 +85,14 @@ pub fn consolidate_sheets(
                 let has_direct_grain = p.has_grain_label == Some(true)
                     || p.grain_locked == Some(true)
                     || p.grain_arrow_degrees.is_some();
-                let is_grain = (global_rot_div <= 2)
-                    || has_direct_grain
-                    || (p.manual_cluster_macro == Some(true));
+                let is_free = p.free_rotation == Some(true) || global_rot_div >= 4;
+                let is_grain = if is_free {
+                    false
+                } else {
+                    (global_rot_div <= 2)
+                        || has_direct_grain
+                        || (p.manual_cluster_macro == Some(true))
+                };
 
                 let allowed_rotations = if is_grain {
                     if global_rot_div == 1 && !has_direct_grain {
@@ -305,10 +310,13 @@ where
     // 2. Parallel multi-strategy exploration (bounded for 10s response time rule)
     let baseline_elapsed = start_mat.elapsed().as_secs_f64();
     let num_threads = rayon::current_num_threads();
-    let num_strategies = if baseline_elapsed > 4.0 {
+    let is_selective = config_obj.selective_repack == Some(true);
+    let num_strategies = if is_selective {
+        (num_threads * 2).clamp(16, 32)
+    } else if baseline_elapsed > 4.0 {
         2.min(num_threads)
     } else {
-        num_threads.clamp(3, 6)
+        num_threads.clamp(6, 16)
     };
 
     if num_strategies > 0 && baseline_elapsed < 8.0 {

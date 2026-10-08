@@ -10,6 +10,7 @@ pub struct JobInput {
     pub source: Option<String>,
     pub max_workers: Option<usize>,
     pub optimization_attempts: Option<usize>,
+    pub optimization_seed: Option<u64>,
     pub materials: Vec<MaterialStateInput>,
 }
 
@@ -23,6 +24,7 @@ pub struct MaterialStateInput {
     pub original_part_count: Option<usize>,
     pub parts: Vec<PartInput>,
     pub learning_key: Option<String>,
+    pub optimization_seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -38,6 +40,7 @@ pub struct ConfigurationInput {
     pub target_sheet_utilization: Option<f64>,
     pub sheet_in_sheet: Option<bool>,
     pub selective_repack: Option<bool>,
+    pub optimization_seed: Option<u64>,
     pub small_part_threshold: Option<f64>,
     pub small_part_clearance: Option<f64>,
     pub small_part_edge_zone: Option<f64>,
@@ -224,6 +227,7 @@ pub struct PlacementOutput {
     pub has_grain_label: Option<bool>,
     pub grain_arrow_degrees: Option<f64>,
     pub grain_locked: Option<bool>,
+    pub free_rotation: Option<bool>,
     pub small_part: Option<bool>,
     pub small_part_clearance: Option<f64>,
     pub small_part_edge_protected: Option<bool>,

@@ -440,11 +440,25 @@ impl SheetContext {
                             h_bbox.min_y + (h_bbox.height() - ph) * 0.5,
                         ));
 
-                        let step_x = (h_bbox.width() - pw - clearance * 2.0).max(0.0) / 4.0;
-                        let step_y = (h_bbox.height() - ph - clearance * 2.0).max(0.0) / 4.0;
+                        // Touching anchors against shapes already placed inside this hole
+                        for inner in &self.placed {
+                            if inner.bbox.min_x >= h_bbox.min_x - 1.0 && inner.bbox.max_x <= h_bbox.max_x + 1.0
+                                && inner.bbox.min_y >= h_bbox.min_y - 1.0 && inner.bbox.max_y <= h_bbox.max_y + 1.0
+                            {
+                                let rx = inner.x + inner.width + clearance;
+                                let ty = inner.y + inner.height + clearance;
+                                candidate_points.push(Point::new(inner.x, ty));
+                                candidate_points.push(Point::new(h_bbox.min_x + clearance, ty));
+                                candidate_points.push(Point::new(rx, inner.y));
+                                candidate_points.push(Point::new(rx, h_bbox.min_y + clearance));
+                            }
+                        }
+
+                        let step_x = (h_bbox.width() - pw - clearance * 2.0).max(0.0) / 6.0;
+                        let step_y = (h_bbox.height() - ph - clearance * 2.0).max(0.0) / 6.0;
                         if step_x > 0.0 && step_y > 0.0 {
-                            for ix in 0..=4 {
-                                for iy in 0..=4 {
+                            for ix in 0..=6 {
+                                for iy in 0..=6 {
                                     candidate_points.push(Point::new(
                                         h_bbox.min_x + clearance + ix as f64 * step_x,
                                         h_bbox.min_y + clearance + iy as f64 * step_y,
