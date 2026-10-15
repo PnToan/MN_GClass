@@ -69,6 +69,7 @@ pub struct ProcessedPart {
     pub small_part_clearance: f64,
     pub variants: Vec<RotatedVariant>,
     pub is_grain_locked: bool,
+    pub shape_key: u64,
 }
 
 pub fn prepare_parts(
@@ -84,6 +85,7 @@ pub fn prepare_parts(
     let global_rot_div = config.rotation_divisions.unwrap_or(1);
     let small_part_threshold = config.small_part_threshold.unwrap_or(0.0).max(0.0);
     let configured_small_part_clearance = config.small_part_clearance.unwrap_or(0.0).max(0.0);
+    let mut variant_cache: std::collections::HashMap<u64, (Vec<RotatedVariant>, u64)> = std::collections::HashMap::new();
 
     parts.iter().map(|p| {
         let poly = Polygon::from_raw(&p.contour);
@@ -124,8 +126,6 @@ pub fn prepare_parts(
         let base_rot = norm_angle(p.base_rotation_degrees.or(p.rotation_degrees).unwrap_or(0.0));
 
         let mut allowed_rotations: Vec<f64> = if is_part_grain_locked {
-            // Quy tắc vân gỗ tuyệt đối: chiều mũi tên theo chiều dài 2440, chỉ xoay 0 hoặc 180 độ.
-            // Tuyệt đối không cho phép 90 hoặc 270 độ, bất kể free_rotation hay global_rot_div.
             if let Some(rots) = &p.rotations {
                 let r: Vec<f64> = rots.iter()
                     .map(|&d| norm_angle(d))
@@ -134,11 +134,7 @@ pub fn prepare_parts(
                         diff <= 2.0 || diff >= 178.0
                     })
                     .collect();
-                if !r.is_empty() {
-                    r
-                } else {
-                    vec![base_rot, norm_angle(base_rot + 180.0)]
-                }
+                if !r.is_empty() { r } else { vec![base_rot, norm_angle(base_rot + 180.0)] }
             } else {
                 vec![base_rot, norm_angle(base_rot + 180.0)]
             }
@@ -147,17 +143,9 @@ pub fn prepare_parts(
             if r.is_empty() { r.push(base_rot); }
             r
         } else if global_rot_div >= 4 || p.free_rotation == Some(true) {
-            vec![
-                base_rot,
-                norm_angle(base_rot + 90.0),
-                norm_angle(base_rot + 180.0),
-                norm_angle(base_rot + 270.0),
-            ]
+            vec![base_rot, norm_angle(base_rot + 90.0), norm_angle(base_rot + 180.0), norm_angle(base_rot + 270.0)]
         } else {
-            vec![
-                base_rot,
-                norm_angle(base_rot + 180.0),
-            ]
+            vec![base_rot, norm_angle(base_rot + 180.0)]
         };
 
         if (global_rot_div >= 4 || p.free_rotation == Some(true)) && !is_part_grain_locked {
@@ -173,119 +161,136 @@ pub fn prepare_parts(
             }
         }
 
-        let variants: Vec<RotatedVariant> = allowed_rotations.iter().map(|&rot| {
-            let rad = rot * std::f64::consts::PI / 180.0;
-            let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-            let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
-            let bbox = norm_poly.bounding_box();
-            let norm_holes: Vec<Polygon> = p.holes.as_ref().map_or(Vec::new(), |holes_vec| {
-                holes_vec.iter().map(|raw_h| {
-                    let h_poly = Polygon::from_raw(raw_h);
-                    let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-                    h_rot.translate(shift_x, shift_y)
-                }).collect()
-            });
-            let norm_layers: Vec<DrawLayerData> = p.draw_layers.as_ref().map_or(Vec::new(), |layers| {
-                layers.iter().map(|layer| {
-                    let norm_paths = layer.paths.as_ref().map_or(Vec::new(), |paths| {
-                        paths.iter().map(|path| {
-                            let rot_pts = path.points.iter().map(|pt_raw| {
-                                let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
-                                [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
-                            }).collect();
-                            DrawPathData {
-                                points: rot_pts,
-                                closed: path.closed,
-                                surface_face: path.surface_face,
-                                surface_face_id: path.surface_face_id.clone(),
-                                surface_loop_type: path.surface_loop_type.clone(),
-                                geometry_kind: path.geometry_kind.clone(),
-                                _nesting_packed_local: Some(true),
-                            }
-                        }).collect()
-                    });
-                    DrawLayerData {
-                        name: layer.name.clone(),
-                        layer_name: layer.layer_name.clone(),
-                        color: layer.color.clone(),
-                        side: layer.side.clone(),
-                        r#type: layer.r#type.clone(),
-                        paths: Some(norm_paths),
-                    }
-                }).collect()
-            });
-            let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
-            let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
-            let dilated_bbox = dilated_poly.bounding_box();
-            RotatedVariant {
-                rotation: rot,
-                norm_poly,
-                norm_holes,
-                norm_layers,
-                dilated_poly,
-                dilated_bbox,
-                bbox,
-                is_rect,
+        let has_layers = p.draw_layers.as_ref().map_or(false, |l| !l.is_empty());
+        let raw_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            small_part.hash(&mut h);
+            small_part_clearance.to_bits().hash(&mut h);
+            p.contour.len().hash(&mut h);
+            for pt in &p.contour {
+                ((pt[0] * 100.0).round() as i64).hash(&mut h);
+                ((pt[1] * 100.0).round() as i64).hash(&mut h);
             }
-        }).filter(|v| v.bbox.width() <= max_bw && v.bbox.height() <= max_bh).collect();
-
-        let final_variants = if variants.is_empty() {
-            let rot = allowed_rotations[0];
-            let rad = rot * std::f64::consts::PI / 180.0;
-            let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-            let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
-            let bbox = norm_poly.bounding_box();
-            let norm_holes: Vec<Polygon> = p.holes.as_ref().map_or(Vec::new(), |holes_vec| {
-                holes_vec.iter().map(|raw_h| {
-                    let h_poly = Polygon::from_raw(raw_h);
-                    let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-                    h_rot.translate(shift_x, shift_y)
-                }).collect()
-            });
-            let norm_layers: Vec<DrawLayerData> = p.draw_layers.as_ref().map_or(Vec::new(), |layers| {
-                layers.iter().map(|layer| {
-                    let norm_paths = layer.paths.as_ref().map_or(Vec::new(), |paths| {
-                        paths.iter().map(|path| {
-                            let rot_pts = path.points.iter().map(|pt_raw| {
-                                let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
-                                [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
-                            }).collect();
-                            DrawPathData {
-                                points: rot_pts,
-                                closed: path.closed,
-                                surface_face: path.surface_face,
-                                surface_face_id: path.surface_face_id.clone(),
-                                surface_loop_type: path.surface_loop_type.clone(),
-                                geometry_kind: path.geometry_kind.clone(),
-                                _nesting_packed_local: Some(true),
-                            }
-                        }).collect()
-                    });
-                    DrawLayerData {
-                        name: layer.name.clone(),
-                        layer_name: layer.layer_name.clone(),
-                        color: layer.color.clone(),
-                        side: layer.side.clone(),
-                        r#type: layer.r#type.clone(),
-                        paths: Some(norm_paths),
+            if let Some(holes) = &p.holes {
+                holes.len().hash(&mut h);
+                for hole in holes {
+                    hole.len().hash(&mut h);
+                    if let Some(fpt) = hole.first() {
+                        ((fpt[0] * 100.0).round() as i64).hash(&mut h);
+                        ((fpt[1] * 100.0).round() as i64).hash(&mut h);
                     }
-                }).collect()
-            });
-            let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
-            let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
-            let dilated_bbox = dilated_poly.bounding_box();
-            vec![RotatedVariant {
-                rotation: rot,
-                norm_poly,
-                norm_holes,
-                norm_layers,
-                dilated_poly,
-                dilated_bbox,
-                bbox,
-                is_rect,
-            }]
+                }
+            }
+            for &rot in &allowed_rotations {
+                ((rot * 100.0).round() as i64).hash(&mut h);
+            }
+            h.finish()
+        };
+
+        let (final_variants, shape_key) = if !has_layers && variant_cache.contains_key(&raw_key) {
+            variant_cache.get(&raw_key).unwrap().clone()
         } else {
-            variants
+            let variants: Vec<RotatedVariant> = allowed_rotations.iter().map(|&rot| {
+                let rad = rot * std::f64::consts::PI / 180.0;
+                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
+                let bbox = norm_poly.bounding_box();
+                let norm_holes: Vec<Polygon> = p.holes.as_ref().map_or(Vec::new(), |holes_vec| {
+                    holes_vec.iter().map(|raw_h| {
+                        let h_poly = Polygon::from_raw(raw_h);
+                        let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                        h_rot.translate(shift_x, shift_y)
+                    }).collect()
+                });
+                let norm_layers: Vec<DrawLayerData> = p.draw_layers.as_ref().map_or(Vec::new(), |layers| {
+                    layers.iter().map(|layer| {
+                        let norm_paths = layer.paths.as_ref().map_or(Vec::new(), |paths| {
+                            paths.iter().map(|path| {
+                                let rot_pts = path.points.iter().map(|pt_raw| {
+                                    let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
+                                    [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
+                                }).collect();
+                                DrawPathData {
+                                    points: rot_pts,
+                                    closed: path.closed,
+                                    surface_face: path.surface_face,
+                                    surface_face_id: path.surface_face_id.clone(),
+                                    surface_loop_type: path.surface_loop_type.clone(),
+                                    geometry_kind: path.geometry_kind.clone(),
+                                    _nesting_packed_local: Some(true),
+                                }
+                            }).collect()
+                        });
+                        DrawLayerData {
+                            name: layer.name.clone(),
+                            layer_name: layer.layer_name.clone(),
+                            color: layer.color.clone(),
+                            side: layer.side.clone(),
+                            r#type: layer.r#type.clone(),
+                            paths: Some(norm_paths),
+                        }
+                    }).collect()
+                });
+                let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
+                let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
+                let dilated_bbox = dilated_poly.bounding_box();
+                RotatedVariant { rotation: rot, norm_poly, norm_holes, norm_layers, dilated_poly, dilated_bbox, bbox, is_rect }
+            }).filter(|v| v.bbox.width() <= max_bw && v.bbox.height() <= max_bh).collect();
+
+            let fv = if variants.is_empty() {
+                let rot = allowed_rotations[0];
+                let rad = rot * std::f64::consts::PI / 180.0;
+                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
+                let bbox = norm_poly.bounding_box();
+                let norm_holes: Vec<Polygon> = p.holes.as_ref().map_or(Vec::new(), |holes_vec| {
+                    holes_vec.iter().map(|raw_h| {
+                        let h_poly = Polygon::from_raw(raw_h);
+                        let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                        h_rot.translate(shift_x, shift_y)
+                    }).collect()
+                });
+                let norm_layers: Vec<DrawLayerData> = p.draw_layers.as_ref().map_or(Vec::new(), |layers| {
+                    layers.iter().map(|layer| {
+                        let norm_paths = layer.paths.as_ref().map_or(Vec::new(), |paths| {
+                            paths.iter().map(|path| {
+                                let rot_pts = path.points.iter().map(|pt_raw| {
+                                    let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
+                                    [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
+                                }).collect();
+                                DrawPathData {
+                                    points: rot_pts,
+                                    closed: path.closed,
+                                    surface_face: path.surface_face,
+                                    surface_face_id: path.surface_face_id.clone(),
+                                    surface_loop_type: path.surface_loop_type.clone(),
+                                    geometry_kind: path.geometry_kind.clone(),
+                                    _nesting_packed_local: Some(true),
+                                }
+                            }).collect()
+                        });
+                        DrawLayerData {
+                            name: layer.name.clone(),
+                            layer_name: layer.layer_name.clone(),
+                            color: layer.color.clone(),
+                            side: layer.side.clone(),
+                            r#type: layer.r#type.clone(),
+                            paths: Some(norm_paths),
+                        }
+                    }).collect()
+                });
+                let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
+                let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
+                let dilated_bbox = dilated_poly.bounding_box();
+                vec![RotatedVariant { rotation: rot, norm_poly, norm_holes, norm_layers, dilated_poly, dilated_bbox, bbox, is_rect }]
+            } else {
+                variants
+            };
+            if !has_layers {
+                variant_cache.insert(raw_key, (fv.clone(), raw_key));
+            }
+            (fv, raw_key)
         };
 
         ProcessedPart {
@@ -300,6 +305,7 @@ pub fn prepare_parts(
             small_part_clearance,
             variants: final_variants,
             is_grain_locked: is_part_grain_locked,
+            shape_key,
         }
     }).collect()
 }
@@ -356,8 +362,12 @@ where
     };
     let compact_directions = config.compact_directions.clone().unwrap_or_else(|| vec!["left".to_string(), "bottom".to_string()]);
 
-    let (paired_parts, new_comb_count) = crate::macro_comb::pair_comb_parts(&material_state.parts, &config, part_spacing);
     let existing_macro_count = material_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
+    let (paired_parts, new_comb_count) = if existing_macro_count > 0 {
+        (material_state.parts.clone(), 0)
+    } else {
+        crate::macro_comb::pair_comb_parts(&material_state.parts, &config, part_spacing)
+    };
     let comb_count = existing_macro_count + new_comb_count;
     let processed = prepare_parts(&paired_parts, &config, part_spacing);
 
@@ -388,22 +398,21 @@ where
     match strategy_id % 10 {
         0 => {
             ordered_parts.sort_by(|a, b| {
-                let a_cluster = a.original.manual_cluster_macro == Some(true);
-                let b_cluster = b.original.manual_cluster_macro == Some(true);
-                if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
-                if a.is_anchor != b.is_anchor { return b.is_anchor.cmp(&a.is_anchor); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 if a.size_group != b.size_group { return a.size_group.cmp(&b.size_group); }
+                let max_a = a.variants[0].bbox.width().max(a.variants[0].bbox.height());
+                let max_b = b.variants[0].bbox.width().max(b.variants[0].bbox.height());
+                let band_a = (max_a / 120.0).floor() as i64;
+                let band_b = (max_b / 120.0).floor() as i64;
+                if band_a != band_b { return band_b.cmp(&band_a); }
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
         1 => {
             ordered_parts.sort_by(|a, b| {
-                let a_cluster = a.original.manual_cluster_macro == Some(true);
-                let b_cluster = b.original.manual_cluster_macro == Some(true);
-                if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
-                if a.is_anchor != b.is_anchor { return b.is_anchor.cmp(&a.is_anchor); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 let h_a = a.variants[0].bbox.height().max(a.variants[0].bbox.width());
                 let h_b = b.variants[0].bbox.height().max(b.variants[0].bbox.width());
                 h_b.partial_cmp(&h_a).unwrap_or(std::cmp::Ordering::Equal)
@@ -412,11 +421,8 @@ where
         }
         2 => {
             ordered_parts.sort_by(|a, b| {
-                let a_cluster = a.original.manual_cluster_macro == Some(true);
-                let b_cluster = b.original.manual_cluster_macro == Some(true);
-                if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
-                if a.is_anchor != b.is_anchor { return b.is_anchor.cmp(&a.is_anchor); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 let w_a = a.variants[0].bbox.width().max(a.variants[0].bbox.height());
                 let w_b = b.variants[0].bbox.width().max(b.variants[0].bbox.height());
                 w_b.partial_cmp(&w_a).unwrap_or(std::cmp::Ordering::Equal)
@@ -425,11 +431,8 @@ where
         }
         3 => {
             ordered_parts.sort_by(|a, b| {
-                let a_cluster = a.original.manual_cluster_macro == Some(true);
-                let b_cluster = b.original.manual_cluster_macro == Some(true);
-                if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
-                if a.is_anchor != b.is_anchor { return b.is_anchor.cmp(&a.is_anchor); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 let perim_a = a.variants[0].bbox.width() + a.variants[0].bbox.height();
                 let perim_b = b.variants[0].bbox.width() + b.variants[0].bbox.height();
                 perim_b.partial_cmp(&perim_a).unwrap_or(std::cmp::Ordering::Equal)
@@ -438,38 +441,42 @@ where
         }
         4 => {
             ordered_parts.sort_by(|a, b| {
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
                 let b_cluster = b.original.manual_cluster_macro == Some(true);
                 if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
                 let a_has_hole = a.original.holes.as_ref().map_or(false, |h| !h.is_empty());
                 let b_has_hole = b.original.holes.as_ref().map_or(false, |h| !h.is_empty());
                 if a_has_hole != b_has_hole { return b_has_hole.cmp(&a_has_hole); }
-                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
                 if a.is_anchor != b.is_anchor { return b.is_anchor.cmp(&a.is_anchor); }
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
         5 => {
             ordered_parts.sort_by(|a, b| {
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
+                if a.is_rect != b.is_rect { return b.is_rect.cmp(&a.is_rect); }
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
                 let b_cluster = b.original.manual_cluster_macro == Some(true);
                 if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
-                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
-                if a.is_rect != b.is_rect { return b.is_rect.cmp(&a.is_rect); }
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
         6 => {
-            // Sắp diện tích tăng dần (Smallest first) - chi tiết nhỏ lấp hốc trước
+            // Sắp diện tích tăng dần trong từng phân vùng (Skeleton trước, Filler sau)
             ordered_parts.sort_by(|a, b| {
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 a.area.partial_cmp(&b.area).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
         7 => {
-            // Aspect ratio giảm dần (thanh dài trước)
+            // Aspect ratio giảm dần (thanh dài trước, giữ Skeleton trước Filler)
             ordered_parts.sort_by(|a, b| {
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 let ar_a = (a.variants[0].bbox.width().max(a.variants[0].bbox.height())) / (a.variants[0].bbox.width().min(a.variants[0].bbox.height()).max(1.0));
                 let ar_b = (b.variants[0].bbox.width().max(b.variants[0].bbox.height())) / (b.variants[0].bbox.width().min(b.variants[0].bbox.height()).max(1.0));
                 ar_b.partial_cmp(&ar_a).unwrap_or(std::cmp::Ordering::Equal)
@@ -477,16 +484,17 @@ where
             });
         }
         8 => {
-            // Interleaved: xen kẽ lớn nhất và nhỏ nhất
+            // Interleaved trong từng nhóm (Skeleton trước, Filler sau)
             ordered_parts.sort_by(|a, b| {
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
-            let n = ordered_parts.len();
-            if n > 2 {
-                let mut interleaved = Vec::with_capacity(n);
+            let split_idx = ordered_parts.partition_point(|p| !p.size_group.is_filler());
+            if split_idx > 2 {
+                let mut interleaved = Vec::with_capacity(ordered_parts.len());
                 let mut l = 0;
-                let mut r = n - 1;
+                let mut r = split_idx - 1;
                 while l <= r {
                     if l == r {
                         interleaved.push(ordered_parts[l].clone());
@@ -497,15 +505,17 @@ where
                     l += 1;
                     r -= 1;
                 }
+                interleaved.extend_from_slice(&ordered_parts[split_idx..]);
                 ordered_parts = interleaved;
             }
         }
         _ => {
             ordered_parts.sort_by(|a, b| {
+                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
+                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
                 let b_cluster = b.original.manual_cluster_macro == Some(true);
                 if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
-                if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
                 if a.is_irregular != b.is_irregular { return b.is_irregular.cmp(&a.is_irregular); }
                 b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -518,9 +528,10 @@ where
         if n > 1 {
             for i in (1..n).rev() {
                 if ordered_parts[i].is_two_sided { continue; }
+                let i_filler = ordered_parts[i].size_group.is_filler();
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let j = ((rng_state >> 32) as usize) % (i + 1);
-                if !ordered_parts[j].is_two_sided {
+                if !ordered_parts[j].is_two_sided && ordered_parts[j].size_group.is_filler() == i_filler {
                     ordered_parts.swap(i, j);
                 }
             }
@@ -535,10 +546,11 @@ where
     let thickness = material_state.thickness.unwrap_or(18.0);
     let board_area = board_width * board_height;
 
-    // Helper closure to try placing a part specifically into hole cavities on a SINGLE sheet
+    // Helper closure to try placing a part specifically into hole or concave pocket cavities on a SINGLE sheet
     let try_place_in_single_sheet_holes = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>]| -> bool {
         let sheet = &mut sheets[sheet_idx];
-        if !sheet.has_holes() {
+        let allow_pockets = sheet_in_sheet || part.size_group.is_filler();
+        if !sheet.has_holes_or_pockets() {
             return false;
         }
         let mut best_variant = None;
@@ -546,7 +558,7 @@ where
         let mut best_score = f64::MAX;
 
         for variant in &part.variants {
-            if let Some((px, py, score)) = sheet.find_best_hole_anchor(
+            if let Some((px, py, score)) = sheet.find_best_hole_or_pocket_anchor(
                 &variant.norm_poly,
                 &variant.dilated_poly,
                 &variant.dilated_bbox,
@@ -554,6 +566,7 @@ where
                 part.small_part,
                 part.small_part_clearance,
                 bl_weight,
+                allow_pockets,
             ) {
                 if score < best_score {
                     best_score = score;
@@ -564,15 +577,9 @@ where
         }
 
         if let (Some((px, py)), Some(variant)) = (best_pt, best_variant) {
-            sheet.add_placed(
-                variant.norm_poly.clone(),
-                variant.norm_holes.clone(),
-                px,
-                py,
-                variant.rotation,
-                part.small_part,
-                part.small_part_clearance,
-            );
+            let col_poly = if variant.norm_poly.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&variant.norm_poly.points, 16.0) } else { variant.norm_poly.clone() };
+            let col_holes = variant.norm_holes.iter().map(|h| if h.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&h.points, 16.0) } else { h.clone() }).collect();
+            sheet.add_placed(col_poly, col_holes, px, py, variant.rotation, part.small_part, part.small_part_clearance);
 
             let placement = PlacementOutput {
                 entity_id: part.original.entity_id.clone().unwrap_or_default(),
@@ -618,10 +625,18 @@ where
     };
 
     // Helper closure to try placing a part onto a SINGLE sheet
-    let try_place_on_single_sheet = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>]| -> bool {
-        if sheet_in_sheet && sheets[sheet_idx].has_holes() {
+    let try_place_on_single_sheet = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>], failed_hole_keys: &mut std::collections::HashSet<u64>| -> bool {
+        if (sheet_in_sheet || part.size_group.is_filler())
+            && sheets[sheet_idx].has_holes_or_pockets()
+            && !failed_hole_keys.contains(&part.shape_key)
+        {
             if try_place_in_single_sheet_holes(part, sheet_idx, sheets, sheet_placements) {
+                if !part.variants[0].norm_holes.is_empty() {
+                    failed_hole_keys.clear();
+                }
                 return true;
+            } else {
+                failed_hole_keys.insert(part.shape_key);
             }
         }
 
@@ -649,15 +664,9 @@ where
         }
 
         if let (Some((px, py)), Some(variant)) = (best_pt, best_variant) {
-            sheet.add_placed(
-                variant.norm_poly.clone(),
-                variant.norm_holes.clone(),
-                px,
-                py,
-                variant.rotation,
-                part.small_part,
-                part.small_part_clearance,
-            );
+            let col_poly = if variant.norm_poly.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&variant.norm_poly.points, 16.0) } else { variant.norm_poly.clone() };
+            let col_holes = variant.norm_holes.iter().map(|h| if h.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&h.points, 16.0) } else { h.clone() }).collect();
+            sheet.add_placed(col_poly, col_holes, px, py, variant.rotation, part.small_part, part.small_part_clearance);
 
             let placement = PlacementOutput {
                 entity_id: part.original.entity_id.clone().unwrap_or_default(),
@@ -709,52 +718,55 @@ where
     while placed_flags.iter().any(|&p| !p) {
         let current_sheet_idx = sheets.len();
         let new_sheet = SheetContext::new(
-            board_width,
-            board_height,
-            edge_margin,
-            part_spacing,
-            small_part_edge_zone,
-            merge_cut_paths,
-            sheet_in_sheet,
-            compact_directions.clone(),
+            board_width, board_height, edge_margin, part_spacing,
+            small_part_edge_zone, merge_cut_paths, sheet_in_sheet, compact_directions.clone(),
         );
         sheets.push(new_sheet);
         sheet_placements.push(Vec::new());
 
         let mut placed_any_on_this_sheet = false;
-
+        let mut failed_hole_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut failed_sheet_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut pass_count = 0;
         loop {
             pass_count += 1;
             let mut placed_in_this_pass = false;
 
-            // Bước A: Ưu tiên nhét chi tiết vào các hốc rỗng trên tấm này
-            for i in 0..total_parts {
-                if placed_flags[i] { continue; }
-                let part = &ordered_parts[i];
-
-                if try_place_in_single_sheet_holes(part, current_sheet_idx, &mut sheets, &mut sheet_placements) {
-                    placed_flags[i] = true;
-                    placed_in_this_pass = true;
-                    placed_any_on_this_sheet = true;
+            if sheets[current_sheet_idx].has_holes_or_pockets() {
+                for i in 0..total_parts {
+                    if placed_flags[i] { continue; }
+                    let part = &ordered_parts[i];
+                    if failed_hole_keys.contains(&part.shape_key) { continue; }
+                    if try_place_in_single_sheet_holes(part, current_sheet_idx, &mut sheets, &mut sheet_placements) {
+                        placed_flags[i] = true;
+                        placed_in_this_pass = true;
+                        placed_any_on_this_sheet = true;
+                        if !part.variants[0].norm_holes.is_empty() {
+                            failed_hole_keys.clear();
+                        }
+                    } else {
+                        failed_hole_keys.insert(part.shape_key);
+                    }
                 }
             }
 
-            // Bước B: Xếp các chi tiết theo thứ tự ưu tiên (lớn trước nhỏ sau, khung xương, răng lược)
             for i in 0..total_parts {
                 if placed_flags[i] { continue; }
                 let part = &ordered_parts[i];
-
-                if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements) {
+                if failed_sheet_keys.contains(&part.shape_key) { continue; }
+                if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys) {
                     placed_flags[i] = true;
                     placed_in_this_pass = true;
                     placed_any_on_this_sheet = true;
+                    if !part.variants[0].norm_holes.is_empty() {
+                        failed_sheet_keys.clear();
+                        failed_hole_keys.clear();
+                    }
+                } else {
+                    failed_sheet_keys.insert(part.shape_key);
                 }
             }
 
-            // Nếu quét qua toàn bộ các chi tiết còn lại mà không thể nhét thêm bất kỳ chi tiết nào,
-            // hoặc đã lặp đủ 2 pass (pass 1 đặt các chi tiết ưu tiên, pass 2 lấp nốt vào các khoảng trống phát sinh),
-            // thì tấm hiện tại đã đạt mật độ tối đa. Chuyển sang mở tấm tiếp theo!
             if !placed_in_this_pass || pass_count >= 2 {
                 break;
             }

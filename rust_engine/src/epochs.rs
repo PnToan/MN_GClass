@@ -76,6 +76,7 @@ pub fn consolidate_sheets(
         } else {
             let mut remaining_placements = Vec::new();
             let src_placements = std::mem::take(&mut layout.sheets[src_idx].placements);
+            let mut failed_target_keys: Vec<std::collections::HashSet<u64>> = vec![std::collections::HashSet::new(); src_idx];
 
             // Try moving each placement from src_sheet to an earlier sheet (0..src_idx)
             for p in src_placements.into_iter() {
@@ -95,19 +96,29 @@ pub fn consolidate_sheets(
                 };
 
                 let allowed_rotations = if is_grain {
-                    if global_rot_div == 1 && !has_direct_grain {
-                        vec![0.0]
-                    } else {
-                        vec![0.0, 180.0]
-                    }
+                    if global_rot_div == 1 && !has_direct_grain { vec![0.0] } else { vec![0.0, 180.0] }
                 } else {
                     vec![0.0, 90.0, 180.0, 270.0]
+                };
+
+                let p_shape_key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    is_grain.hash(&mut h);
+                    p.contour.len().hash(&mut h);
+                    ((p.packed_width * 10.0).round() as i64).hash(&mut h);
+                    ((p.packed_height * 10.0).round() as i64).hash(&mut h);
+                    (p_area.round() as i64).hash(&mut h);
+                    h.finish()
                 };
 
                 let mut moved = false;
 
                 for target_idx in 0..src_idx {
                     if board_area - sheet_used_area[target_idx] < p_area * 1.05 {
+                        continue;
+                    }
+                    if failed_target_keys[target_idx].contains(&p_shape_key) {
                         continue;
                     }
                     let ctx = &mut contexts[target_idx];
@@ -136,22 +147,12 @@ pub fn consolidate_sheets(
                         let dilated_bbox = dilated_poly.bounding_box();
 
                         if let Some((px, py, _)) = ctx.find_best_anchor(
-                            &norm_poly,
-                            &dilated_poly,
-                            &dilated_bbox,
-                            is_rect,
-                            p.small_part.unwrap_or(false),
-                            p.small_part_clearance.unwrap_or(0.0),
-                            1.0,
+                            &norm_poly, &dilated_poly, &dilated_bbox, is_rect,
+                            p.small_part.unwrap_or(false), p.small_part_clearance.unwrap_or(0.0), 1.0,
                         ) {
                             ctx.add_placed(
-                                norm_poly.clone(),
-                                norm_holes.clone(),
-                                px,
-                                py,
-                                new_rot,
-                                p.small_part.unwrap_or(false),
-                                p.small_part_clearance.unwrap_or(0.0),
+                                norm_poly.clone(), norm_holes.clone(), px, py, new_rot,
+                                p.small_part.unwrap_or(false), p.small_part_clearance.unwrap_or(0.0),
                             );
                             let mut new_p = p.clone();
                             new_p.x = px;
@@ -162,11 +163,7 @@ pub fn consolidate_sheets(
                             new_p.contour = norm_poly.to_raw();
                             new_p.holes = if norm_holes.is_empty() { None } else { Some(norm_holes.iter().map(|h| h.to_raw()).collect()) };
                             new_p.small_part_edge_protected = Some(ctx.small_part_edge_protected(
-                                p.small_part.unwrap_or(false),
-                                px,
-                                py,
-                                bbox.width(),
-                                bbox.height(),
+                                p.small_part.unwrap_or(false), px, py, bbox.width(), bbox.height(),
                             ));
                             let norm_layers: Option<Vec<crate::types::DrawLayerData>> = p.draw_layers.as_ref().map(|layers| {
                                 let rad = delta_rot * std::f64::consts::PI / 180.0;
@@ -178,23 +175,16 @@ pub fn consolidate_sheets(
                                                 [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
                                             }).collect();
                                             crate::types::DrawPathData {
-                                                points: rot_pts,
-                                                closed: path.closed,
-                                                surface_face: path.surface_face,
-                                                surface_face_id: path.surface_face_id.clone(),
-                                                surface_loop_type: path.surface_loop_type.clone(),
-                                                geometry_kind: path.geometry_kind.clone(),
-                                                _nesting_packed_local: Some(true),
+                                                points: rot_pts, closed: path.closed, surface_face: path.surface_face,
+                                                surface_face_id: path.surface_face_id.clone(), surface_loop_type: path.surface_loop_type.clone(),
+                                                geometry_kind: path.geometry_kind.clone(), _nesting_packed_local: Some(true),
                                             }
                                         }).collect()
                                     });
                                     crate::types::DrawLayerData {
-                                        name: layer.name.clone(),
-                                        layer_name: layer.layer_name.clone(),
-                                        color: layer.color.clone(),
-                                        side: layer.side.clone(),
-                                        r#type: layer.r#type.clone(),
-                                        paths: norm_paths,
+                                        name: layer.name.clone(), layer_name: layer.layer_name.clone(),
+                                        color: layer.color.clone(), side: layer.side.clone(),
+                                        r#type: layer.r#type.clone(), paths: norm_paths,
                                     }
                                 }).collect()
                             });
@@ -209,7 +199,10 @@ pub fn consolidate_sheets(
                     if moved {
                         sheet_used_area[target_idx] += p_area;
                         sheet_used_area[src_idx] -= p_area;
+                        failed_target_keys[target_idx].clear();
                         break;
+                    } else {
+                        failed_target_keys[target_idx].insert(p_shape_key);
                     }
                 }
 

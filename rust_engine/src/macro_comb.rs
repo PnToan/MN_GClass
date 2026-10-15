@@ -621,6 +621,114 @@ pub fn create_macro_part(
     }
 }
 
+pub fn polygons_collide_concave_safe(poly1: &Polygon, poly2: &Polygon, spacing: f64) -> bool {
+    let bbox1 = poly1.bounding_box();
+    let bbox2 = poly2.bounding_box();
+    let pad = spacing.max(0.0) - 1e-4;
+    if bbox1.min_x >= bbox2.max_x + pad
+        || bbox1.max_x <= bbox2.min_x - pad
+        || bbox1.min_y >= bbox2.max_y + pad
+        || bbox1.max_y <= bbox2.min_y - pad
+    {
+        return false;
+    }
+    if poly1.is_rectangular() && poly2.is_rectangular() {
+        return true;
+    }
+    let n1 = poly1.points.len();
+    let n2 = poly2.points.len();
+    if n1 < 3 || n2 < 3 {
+        return false;
+    }
+    for i in 0..n1 {
+        let p1 = poly1.points[i];
+        let p2 = poly1.points[(i + 1) % n1];
+        let p_min_x = p1.x.min(p2.x);
+        let p_max_x = p1.x.max(p2.x);
+        if p_max_x <= bbox2.min_x - pad || p_min_x >= bbox2.max_x + pad {
+            continue;
+        }
+        let p_min_y = p1.y.min(p2.y);
+        let p_max_y = p1.y.max(p2.y);
+        if p_max_y <= bbox2.min_y - pad || p_min_y >= bbox2.max_y + pad {
+            continue;
+        }
+        for j in 0..n2 {
+            let q1 = poly2.points[j];
+            let q2 = poly2.points[(j + 1) % n2];
+            if p_max_x <= q1.x.min(q2.x) - pad
+                || p_min_x >= q1.x.max(q2.x) + pad
+                || p_max_y <= q1.y.min(q2.y) - pad
+                || p_min_y >= q1.y.max(q2.y) + pad
+            {
+                continue;
+            }
+            if spacing > 1e-4 {
+                if crate::geometry::segment_to_segment_distance(p1, p2, q1, q2) < pad {
+                    return true;
+                }
+            } else if crate::geometry::segments_intersect_proper(p1, p2, q1, q2) {
+                return true;
+            }
+        }
+    }
+    for pt in &poly1.points {
+        if pt.x > bbox2.min_x && pt.x < bbox2.max_x && pt.y > bbox2.min_y && pt.y < bbox2.max_y && poly2.contains_point_strict(*pt, 0.0) {
+            return true;
+        }
+    }
+    for pt in &poly2.points {
+        if pt.x > bbox1.min_x && pt.x < bbox1.max_x && pt.y > bbox1.min_y && pt.y < bbox1.max_y && poly1.contains_point_strict(*pt, 0.0) {
+            return true;
+        }
+    }
+    let c2 = poly2.centroid();
+    if c2.x > bbox1.min_x && c2.x < bbox1.max_x && c2.y > bbox1.min_y && c2.y < bbox1.max_y && poly2.contains_point_strict(c2, 0.0) && poly1.contains_point_strict(c2, 0.0) {
+        return true;
+    }
+    let c1 = poly1.centroid();
+    if c1.x > bbox2.min_x && c1.x < bbox2.max_x && c1.y > bbox2.min_y && c1.y < bbox2.max_y && poly1.contains_point_strict(c1, 0.0) && poly2.contains_point_strict(c1, 0.0) {
+        return true;
+    }
+    false
+}
+
+pub fn decimate_curved_polygon(points: &[Point], max_chord: f64) -> Polygon {
+    if points.len() <= 40 {
+        return Polygon::new(points.to_vec());
+    }
+    let n = points.len();
+    let mut out = Vec::with_capacity(48);
+    out.push(points[0]);
+    let max_chord_sq = max_chord * max_chord;
+    for i in 1..n {
+        let prev = points[i - 1];
+        let curr = points[i];
+        let next = points[(i + 1) % n];
+        let last_kept = *out.last().unwrap();
+        let dist_sq = (curr.x - last_kept.x).powi(2) + (curr.y - last_kept.y).powi(2);
+        let ux = curr.x - prev.x;
+        let uy = curr.y - prev.y;
+        let vx = next.x - curr.x;
+        let vy = next.y - curr.y;
+        let len_u = ux.hypot(uy);
+        let len_v = vx.hypot(vy);
+        let is_sharp_corner = if len_u > 1e-5 && len_v > 1e-5 {
+            (ux * vx + uy * vy) / (len_u * len_v) < 0.96
+        } else {
+            false
+        };
+        if is_sharp_corner || dist_sq >= max_chord_sq {
+            out.push(curr);
+        }
+    }
+    if out.len() >= 3 {
+        Polygon::new(out)
+    } else {
+        Polygon::new(points.to_vec())
+    }
+}
+
 pub fn find_parallel_nesting_vector(
     poly: &Polygon,
     spacing: f64,
@@ -644,7 +752,7 @@ pub fn find_parallel_nesting_vector(
     }
 
     let mut best_vector: Option<(f64, f64, f64)> = None;
-    let mut min_ratio = 1.65; // True nesting must achieve union bbox ratio <= 1.65 (side-by-side is >= 2.0)
+    let mut min_score = f64::MAX;
 
     let sp = spacing.max(0.0);
     let r_max = (w0.hypot(h0)).min(w0.max(h0) * 1.5);
@@ -654,6 +762,7 @@ pub fn find_parallel_nesting_vector(
 
     let num_angles = 120;
     let dr = (sp * 0.5).clamp(2.0, 6.0);
+    let coarse_poly = decimate_curved_polygon(&poly.points, 16.0);
 
     for step in 0..num_angles {
         let angle = (step as f64) * 2.0 * PI / (num_angles as f64);
@@ -664,8 +773,8 @@ pub fn find_parallel_nesting_vector(
         let mut found_r = None;
         let mut r = sp.max(1.0);
         while r <= r_max {
-            let shifted = poly.translate(r * ux, r * uy);
-            if !polygons_collide_with_spacing(poly, &shifted, sp) {
+            let shifted = coarse_poly.translate(r * ux, r * uy);
+            if !polygons_collide_concave_safe(&coarse_poly, &shifted, sp) {
                 found_r = Some(r);
                 break;
             }
@@ -682,22 +791,16 @@ pub fn find_parallel_nesting_vector(
         let mut hi = r_coarse;
         for _ in 0..8 {
             let mid = (lo + hi) * 0.5;
-            let shifted = poly.translate(mid * ux, mid * uy);
-            if polygons_collide_with_spacing(poly, &shifted, sp) {
+            let shifted = coarse_poly.translate(mid * ux, mid * uy);
+            if polygons_collide_concave_safe(&coarse_poly, &shifted, sp) {
                 lo = mid;
             } else {
                 hi = mid;
             }
         }
-        let r_exact = hi + 0.15; // small safety buffer to ensure zero collision
-
+        let r_exact = hi + 0.35;
         let dx = r_exact * ux;
         let dy = r_exact * uy;
-
-        let shifted1 = poly.translate(dx, dy);
-        if polygons_collide_with_spacing(poly, &shifted1, sp) {
-            continue;
-        }
 
         // 3. Check bounding box overlap condition:
         // For true nested stack, parts penetrate each other's bounding box
@@ -705,7 +808,7 @@ pub fn find_parallel_nesting_vector(
             continue;
         }
 
-        // 4. Compute bounding box of pair
+        // 4. Compute bounding box of pair & multi-part stack
         let min_x = bbox.min_x.min(bbox.min_x + dx);
         let max_x = bbox.max_x.max(bbox.max_x + dx);
         let min_y = bbox.min_y.min(bbox.min_y + dy);
@@ -719,13 +822,46 @@ pub fn find_parallel_nesting_vector(
 
         let pair_area = pair_w * pair_h;
         let ratio = pair_area / bbox_area;
+        if ratio >= 1.82 {
+            continue;
+        }
 
-        if ratio < min_ratio {
-            // Verify that 2 steps (a stack of 3 parts) remains collision-free
-            let shifted2 = poly.translate(2.0 * dx, 2.0 * dy);
-            if !polygons_collide_with_spacing(poly, &shifted2, sp) {
-                min_ratio = ratio;
-                best_vector = Some((dx, dy, ratio));
+        let (stack6_w, stack6_h) = compute_stack_dimensions(poly, 6, dx, dy);
+        let stack6_area_ratio = (stack6_w * stack6_h) / (6.0 * bbox_area);
+        let cardinal_bonus = if dx.abs() < 0.1 || dy.abs() < 0.1 {
+            0.70
+        } else if dx.abs() < 0.25 || dy.abs() < 0.25 {
+            0.88
+        } else {
+            1.0
+        };
+        let stack_fit_bonus = if (stack6_w <= max_bw && stack6_h <= max_bh) || (stack6_w <= max_bh && stack6_h <= max_bw) {
+            1.0
+        } else {
+            1.25
+        };
+        let score = (ratio * 0.35 + stack6_area_ratio * 0.65) * cardinal_bonus * stack_fit_bonus;
+
+        if score < min_score {
+            // Verify on exact poly that 1 step and 2 steps remain collision-free
+            let mut r_ver = r_exact;
+            let mut verified = None;
+            for _ in 0..4 {
+                let vdx = r_ver * ux;
+                let vdy = r_ver * uy;
+                let s1 = poly.translate(vdx, vdy);
+                let s2 = poly.translate(2.0 * vdx, 2.0 * vdy);
+                if !polygons_collide_concave_safe(poly, &s1, sp)
+                    && !polygons_collide_concave_safe(poly, &s2, sp)
+                {
+                    verified = Some((vdx, vdy));
+                    break;
+                }
+                r_ver += 0.5;
+            }
+            if let Some((vdx, vdy)) = verified {
+                min_score = score;
+                best_vector = Some((vdx, vdy, ratio));
             }
         }
     }
@@ -749,6 +885,180 @@ pub fn compute_stack_dimensions(poly: &Polygon, count: usize, dx: f64, dy: f64) 
         max_y = max_y.max(bbox.max_y + shift_y);
     }
     (max_x - min_x, max_y - min_y)
+}
+
+fn build_stack_profile_contour(
+    base_poly: &Polygon,
+    count: usize,
+    dx: f64,
+    dy: f64,
+    min_x: f64,
+    min_y: f64,
+    macro_w: f64,
+    macro_h: f64,
+) -> Vec<[f64; 2]> {
+    let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
+    let rect_fallback = vec![
+        [0.0, 0.0],
+        [macro_w, 0.0],
+        [macro_w, macro_h],
+        [0.0, macro_h],
+    ];
+    if count < 2 || macro_w < 20.0 || macro_h < 20.0 || base_poly.points.len() < 3 {
+        return rect_fallback;
+    }
+
+    let shifted_polys: Vec<Polygon> = (0..count)
+        .map(|k| base_poly.translate((k as f64 * dx) - min_x, (k as f64 * dy) - min_y))
+        .collect();
+
+    let num_slices = 16usize;
+
+    // 1. X-slice envelope (vertical slices along [0, macro_w])
+    let step_x = macro_w / (num_slices as f64);
+    let mut bot_y = vec![macro_h; num_slices];
+    let mut top_y = vec![0.0f64; num_slices];
+    for sp in &shifted_polys {
+        let n = sp.points.len();
+        for i in 0..n {
+            let p1 = sp.points[i];
+            let p2 = sp.points[(i + 1) % n];
+            let seg_min_x = p1.x.min(p2.x);
+            let seg_max_x = p1.x.max(p2.x);
+            let s_start = ((seg_min_x / step_x).floor() as isize).clamp(0, (num_slices - 1) as isize) as usize;
+            let s_end = ((seg_max_x / step_x).floor() as isize).clamp(0, (num_slices - 1) as isize) as usize;
+            for s in s_start..=s_end {
+                let x_lo = (s as f64) * step_x;
+                let x_hi = if s + 1 == num_slices { macro_w } else { ((s + 1) as f64) * step_x };
+                if p1.x >= x_lo - 1e-4 && p1.x <= x_hi + 1e-4 {
+                    bot_y[s] = bot_y[s].min(p1.y);
+                    top_y[s] = top_y[s].max(p1.y);
+                }
+                if p2.x >= x_lo - 1e-4 && p2.x <= x_hi + 1e-4 {
+                    bot_y[s] = bot_y[s].min(p2.y);
+                    top_y[s] = top_y[s].max(p2.y);
+                }
+                let seg_dx = p2.x - p1.x;
+                if seg_dx.abs() > 1e-6 {
+                    for &bx in &[x_lo, x_hi] {
+                        let t = (bx - p1.x) / seg_dx;
+                        if t >= 0.0 && t <= 1.0 {
+                            let y_at = p1.y + t * (p2.y - p1.y);
+                            bot_y[s] = bot_y[s].min(y_at);
+                            top_y[s] = top_y[s].max(y_at);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut x_pts = Vec::with_capacity(num_slices * 4);
+    for s in 0..num_slices {
+        if bot_y[s] <= top_y[s] {
+            let x_lo = if s == 0 { 0.0 } else { (s as f64) * step_x };
+            let x_hi = if s + 1 == num_slices { macro_w } else { ((s + 1) as f64) * step_x };
+            let by = bot_y[s].clamp(0.0, macro_h);
+            x_pts.push(Point::new(round3(x_lo), round3(by)));
+            x_pts.push(Point::new(round3(x_hi), round3(by)));
+        }
+    }
+    for s in (0..num_slices).rev() {
+        if bot_y[s] <= top_y[s] {
+            let x_lo = if s == 0 { 0.0 } else { (s as f64) * step_x };
+            let x_hi = if s + 1 == num_slices { macro_w } else { ((s + 1) as f64) * step_x };
+            let ty = top_y[s].clamp(0.0, macro_h);
+            x_pts.push(Point::new(round3(x_hi), round3(ty)));
+            x_pts.push(Point::new(round3(x_lo), round3(ty)));
+        }
+    }
+    let x_simp = simplify_collinear(&x_pts, 0.5);
+    let x_poly = Polygon::new(x_simp);
+
+    // 2. Y-slice envelope (horizontal slices along [0, macro_h])
+    let step_y = macro_h / (num_slices as f64);
+    let mut left_x = vec![macro_w; num_slices];
+    let mut right_x = vec![0.0f64; num_slices];
+    for sp in &shifted_polys {
+        let n = sp.points.len();
+        for i in 0..n {
+            let p1 = sp.points[i];
+            let p2 = sp.points[(i + 1) % n];
+            let seg_min_y = p1.y.min(p2.y);
+            let seg_max_y = p1.y.max(p2.y);
+            let s_start = ((seg_min_y / step_y).floor() as isize).clamp(0, (num_slices - 1) as isize) as usize;
+            let s_end = ((seg_max_y / step_y).floor() as isize).clamp(0, (num_slices - 1) as isize) as usize;
+            for s in s_start..=s_end {
+                let y_lo = (s as f64) * step_y;
+                let y_hi = if s + 1 == num_slices { macro_h } else { ((s + 1) as f64) * step_y };
+                if p1.y >= y_lo - 1e-4 && p1.y <= y_hi + 1e-4 {
+                    left_x[s] = left_x[s].min(p1.x);
+                    right_x[s] = right_x[s].max(p1.x);
+                }
+                if p2.y >= y_lo - 1e-4 && p2.y <= y_hi + 1e-4 {
+                    left_x[s] = left_x[s].min(p2.x);
+                    right_x[s] = right_x[s].max(p2.x);
+                }
+                let seg_dy = p2.y - p1.y;
+                if seg_dy.abs() > 1e-6 {
+                    for &by in &[y_lo, y_hi] {
+                        let t = (by - p1.y) / seg_dy;
+                        if t >= 0.0 && t <= 1.0 {
+                            let x_at = p1.x + t * (p2.x - p1.x);
+                            left_x[s] = left_x[s].min(x_at);
+                            right_x[s] = right_x[s].max(x_at);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut y_pts = Vec::with_capacity(num_slices * 4);
+    for s in 0..num_slices {
+        if left_x[s] <= right_x[s] {
+            let y_lo = if s == 0 { 0.0 } else { (s as f64) * step_y };
+            let y_hi = if s + 1 == num_slices { macro_h } else { ((s + 1) as f64) * step_y };
+            let rx = right_x[s].clamp(0.0, macro_w);
+            y_pts.push(Point::new(round3(rx), round3(y_lo)));
+            y_pts.push(Point::new(round3(rx), round3(y_hi)));
+        }
+    }
+    for s in (0..num_slices).rev() {
+        if left_x[s] <= right_x[s] {
+            let y_lo = if s == 0 { 0.0 } else { (s as f64) * step_y };
+            let y_hi = if s + 1 == num_slices { macro_h } else { ((s + 1) as f64) * step_y };
+            let lx = left_x[s].clamp(0.0, macro_w);
+            y_pts.push(Point::new(round3(lx), round3(y_hi)));
+            y_pts.push(Point::new(round3(lx), round3(y_lo)));
+        }
+    }
+    let y_simp = simplify_collinear(&y_pts, 0.5);
+    let y_poly = Polygon::new(y_simp);
+
+    let rect_area = macro_w * macro_h;
+    let x_area = x_poly.area();
+    let y_area = y_poly.area();
+
+    let best_poly = if x_poly.points.len() >= 4 && x_area > 1.0 && (x_area <= y_area || y_poly.points.len() < 4) {
+        Some((x_poly, x_area))
+    } else if y_poly.points.len() >= 4 && y_area > 1.0 {
+        Some((y_poly, y_area))
+    } else {
+        None
+    };
+
+    if let Some((bp, b_area)) = best_poly {
+        let bb = bp.bounding_box();
+        if b_area < rect_area * 0.96
+            && (bb.width() - macro_w).abs() < 1.0
+            && (bb.height() - macro_h).abs() < 1.0
+        {
+            return bp.to_raw();
+        }
+    }
+
+    rect_fallback
 }
 
 pub fn create_parallel_nested_stack_macro(
@@ -829,6 +1139,16 @@ pub fn create_parallel_nested_stack_macro(
 
     let macro_w = round3(stack_w);
     let macro_h = round3(stack_h);
+    let profile_contour = build_stack_profile_contour(
+        &poly,
+        stack_parts.len(),
+        dx,
+        dy,
+        min_x,
+        min_y,
+        macro_w,
+        macro_h,
+    );
 
     PartInput {
         entity_id: Some(macro_eid),
@@ -837,12 +1157,7 @@ pub fn create_parallel_nested_stack_macro(
         width: Some(macro_w),
         height: Some(macro_h),
         area: Some(round3(total_area)),
-        contour: vec![
-            [0.0, 0.0],
-            [macro_w, 0.0],
-            [macro_w, macro_h],
-            [0.0, macro_h],
-        ],
+        contour: profile_contour,
         holes: None,
         render_contour: None,
         render_holes: None,
@@ -925,21 +1240,43 @@ pub fn pair_comb_parts(
     let max_bw = (board_w - margin * 2.0).max(100.0);
     let max_bh = (board_h - margin * 2.0).max(100.0);
 
+    let mut raw_sig_cache: std::collections::HashMap<u64, (bool, String)> = std::collections::HashMap::new();
     for (i, p) in parts.iter().enumerate() {
         if p.manual_cluster_macro == Some(true) {
             signatures.push(String::new());
             continue;
         }
-        let poly = Polygon::from_raw(&p.contour);
-        if is_contour_curved(&poly, p.has_circular_arc) {
-            signatures.push(String::new());
-            continue;
-        }
-        let bbox = poly.bounding_box();
-        let area = p.area.unwrap_or_else(|| poly.area());
-        if is_truly_irregular(&poly, &bbox, area) {
+        let raw_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            p.has_circular_arc.hash(&mut h);
+            p.contour.len().hash(&mut h);
+            for pt in &p.contour {
+                ((pt[0] * 100.0).round() as i64).hash(&mut h);
+                ((pt[1] * 100.0).round() as i64).hash(&mut h);
+            }
+            h.finish()
+        };
+        let (is_cand, base_sig) = if let Some(cached) = raw_sig_cache.get(&raw_hash) {
+            cached.clone()
+        } else {
+            let poly = Polygon::from_raw(&p.contour);
+            let res = if is_contour_curved(&poly, p.has_circular_arc) {
+                (false, String::new())
+            } else {
+                let bbox = poly.bounding_box();
+                let area = p.area.unwrap_or_else(|| poly.area());
+                if is_truly_irregular(&poly, &bbox, area) {
+                    (true, compute_shape_signature(p))
+                } else {
+                    (false, String::new())
+                }
+            };
+            raw_sig_cache.insert(raw_hash, res.clone());
+            res
+        };
+        if is_cand {
             candidate_indices.push(i);
-            let base_sig = compute_shape_signature(p);
             signatures.push(base_sig);
         } else {
             signatures.push(String::new());
@@ -1019,17 +1356,30 @@ pub fn pair_comb_parts(
 
                 for (_key, g_indices) in grain_groups.iter() {
                     let mut i = 0;
+                    let deep_cardinal_batch = g_indices.len() >= 12
+                        && (dx.abs() < 0.1 || dy.abs() < 0.1)
+                        && dx.hypot(dy) <= 100.0;
+                    let half_long_board = (max_bw.max(max_bh) - spacing) * 0.5;
                     while i < g_indices.len() {
                         let remaining = g_indices.len() - i;
                         if remaining < 2 {
                             break;
                         }
-                        let mut chunk_size = if remaining == 7 { 4 } else { remaining.min(6) };
+                        let mut chunk_size = if deep_cardinal_batch {
+                            let max_c = 12usize;
+                            let target_chunks = (remaining + max_c - 1) / max_c;
+                            ((remaining + target_chunks - 1) / target_chunks).min(max_c)
+                        } else if remaining == 7 {
+                            4
+                        } else {
+                            remaining.min(6)
+                        };
                         while chunk_size > 2 {
                             let (sw, sh) = compute_stack_dimensions(&poly_first, chunk_size, dx, dy);
                             let fits_normal = sw <= max_bw && sh <= max_bh;
                             let fits_rotated = sw <= max_bh && sh <= max_bw;
-                            if fits_normal || (!global_grain_locked && fits_rotated) {
+                            let fits_half_long = !deep_cardinal_batch || chunk_size <= 6 || sw.max(sh) <= half_long_board;
+                            if fits_half_long && (fits_normal || (!global_grain_locked && fits_rotated)) {
                                 break;
                             }
                             chunk_size -= 1;
