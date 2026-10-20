@@ -249,6 +249,15 @@ impl SheetContext {
             if !shape.holes.is_empty() {
                 let inside_hole = shape.holes.iter().any(|h| {
                     polygon_contained_in_hole(shifted_poly, h, required_clearance)
+                        || (shape.poly.is_rectangular()
+                            && Self::polygon_in_open_mouth_hole(
+                                shifted_poly,
+                                &shifted_bbox,
+                                is_rect,
+                                h,
+                                &shape.bbox,
+                                required_clearance,
+                            ))
                 });
                 if inside_hole {
                     continue;
@@ -265,6 +274,42 @@ impl SheetContext {
         }
 
         true
+    }
+
+    #[inline]
+    fn polygon_in_open_mouth_hole(
+        _shifted_poly: &Polygon,
+        shifted_bbox: &Rect,
+        _is_rect: bool,
+        hole: &Polygon,
+        shape_bbox: &Rect,
+        clearance: f64,
+    ) -> bool {
+        let h_bbox = hole.bounding_box();
+        let open_top = (h_bbox.max_y - shape_bbox.max_y).abs() <= 2.0;
+        let open_bottom = (h_bbox.min_y - shape_bbox.min_y).abs() <= 2.0;
+        let open_left = (h_bbox.min_x - shape_bbox.min_x).abs() <= 2.0;
+        let open_right = (h_bbox.max_x - shape_bbox.max_x).abs() <= 2.0;
+        if !(open_top || open_bottom || open_left || open_right) {
+            return false;
+        }
+        if !open_left && shifted_bbox.min_x < h_bbox.min_x + clearance - 1e-4 {
+            return false;
+        }
+        if !open_right && shifted_bbox.max_x > h_bbox.max_x - clearance + 1e-4 {
+            return false;
+        }
+        if !open_bottom && shifted_bbox.min_y < h_bbox.min_y + clearance - 1e-4 {
+            return false;
+        }
+        if !open_top && shifted_bbox.max_y > h_bbox.max_y - clearance + 1e-4 {
+            return false;
+        }
+        let inter_w = (shifted_bbox.max_x.min(h_bbox.max_x) - shifted_bbox.min_x.max(h_bbox.min_x)).max(0.0);
+        let inter_h = (shifted_bbox.max_y.min(h_bbox.max_y) - shifted_bbox.min_y.max(h_bbox.min_y)).max(0.0);
+        let pw = shifted_bbox.width().max(1e-6);
+        let ph = shifted_bbox.height().max(1e-6);
+        inter_w >= pw * 0.42 && inter_h >= ph * 0.42
     }
 
     pub fn find_best_anchor(
@@ -330,13 +375,28 @@ impl SheetContext {
                 candidate_points.push(Point::new(bounds.min_x, by));
 
                 if !shape.is_rect {
-                    for &ratio in &[0.55, 0.75] {
+                    for &ratio in &[0.25, 0.40, 0.55, 0.75] {
                         let pen_rx = shape.x + shape.width * ratio;
                         let pen_ty = shape.y + shape.height * ratio;
                         candidate_points.push(Point::new(pen_rx, shape.y));
                         candidate_points.push(Point::new(pen_rx, bounds.min_y));
                         candidate_points.push(Point::new(shape.x, pen_ty));
                         candidate_points.push(Point::new(bounds.min_x, pen_ty));
+                    }
+                    let mut v_added = 0usize;
+                    let v_step = (shape.poly.points.len() / 6).max(1);
+                    for v in shape.poly.points.iter().step_by(v_step) {
+                        let in_x = v.x > shape.bbox.min_x + 5.0 && v.x < shape.bbox.max_x - 5.0;
+                        let in_y = v.y > shape.bbox.min_y + 5.0 && v.y < shape.bbox.max_y - 5.0;
+                        if in_x || in_y {
+                            candidate_points.push(Point::new(v.x + clearance, v.y + clearance));
+                            candidate_points.push(Point::new(v.x + clearance, shape.y));
+                            candidate_points.push(Point::new(shape.x, v.y + clearance));
+                            v_added += 1;
+                            if v_added >= 6 {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -362,6 +422,8 @@ impl SheetContext {
         });
         candidate_points.dedup_by(|a, b| (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5);
 
+        let has_irregular_placed = !is_rect || self.placed.iter().any(|s| !s.is_rect);
+
         for pt in candidate_points {
             if self.can_place_precomputed(
                 norm_poly,
@@ -375,9 +437,9 @@ impl SheetContext {
             ) {
                 let mut fx = pt.x;
                 let mut fy = pt.y;
-                if !is_rect {
-                    let mut step_x = if pull_right { 24.0 } else { -24.0 };
-                    for _ in 0..4 {
+                if has_irregular_placed {
+                    let mut step_x = if pull_right { 36.0 } else { -36.0 };
+                    for _ in 0..5 {
                         let nx = (fx + step_x).clamp(bounds.min_x, bounds.max_x - pw);
                         if (nx - fx).abs() > 0.2 && self.can_place_precomputed(
                             norm_poly, dilated_poly, dilated_bbox, is_rect,
@@ -388,8 +450,8 @@ impl SheetContext {
                             step_x *= 0.5;
                         }
                     }
-                    let mut step_y = if pull_top { 24.0 } else { -24.0 };
-                    for _ in 0..4 {
+                    let mut step_y = if pull_top { 36.0 } else { -36.0 };
+                    for _ in 0..5 {
                         let ny = (fy + step_y).clamp(bounds.min_y, bounds.max_y - ph);
                         if (ny - fy).abs() > 0.2 && self.can_place_precomputed(
                             norm_poly, dilated_poly, dilated_bbox, is_rect,
@@ -479,41 +541,147 @@ impl SheetContext {
             hole_clearances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             hole_clearances.dedup_by(|a, b| (*a - *b).abs() <= 1e-6);
 
+            let mouth_tol = if shape.poly.is_rectangular() { 2.0 } else { 15.0 };
+
             for hole in &shape.holes {
                 let h_bbox = hole.bounding_box();
+                let open_top = (h_bbox.max_y - shape.bbox.max_y).abs() <= mouth_tol;
+                let open_bottom = (h_bbox.min_y - shape.bbox.min_y).abs() <= mouth_tol;
+                let open_left = (h_bbox.min_x - shape.bbox.min_x).abs() <= mouth_tol;
+                let open_right = (h_bbox.max_x - shape.bbox.max_x).abs() <= mouth_tol;
+
                 for hole_clearance in &hole_clearances {
                     let clearance = *hole_clearance;
-                    let avail_w = h_bbox.width() - pw - clearance * 2.0;
-                    let avail_h = h_bbox.height() - ph - clearance * 2.0;
-                    if avail_w >= 0.0 && avail_h >= 0.0 {
-                        let base_x = h_bbox.min_x + clearance;
-                        let base_y = h_bbox.min_y + clearance;
-                        let mid_x = h_bbox.min_x + (h_bbox.width() - pw) * 0.5;
-                        let mid_y = h_bbox.min_y + (h_bbox.height() - ph) * 0.5;
+                    let req_w = if open_left || open_right {
+                        pw * 0.42 + clearance
+                    } else {
+                        pw + clearance * 2.0
+                    };
+                    let req_h = if open_top || open_bottom {
+                        ph * 0.42 + clearance
+                    } else {
+                        ph + clearance * 2.0
+                    };
+                    if h_bbox.width() + 1e-4 < req_w || h_bbox.height() + 1e-4 < req_h {
+                        continue;
+                    }
 
-                        candidate_points.push(Point::new(base_x, base_y));
-                        candidate_points.push(Point::new(mid_x, mid_y));
-                        if avail_w > 10.0 {
-                            candidate_points.push(Point::new(base_x + avail_w * 0.16, mid_y));
-                            candidate_points.push(Point::new(base_x + avail_w * 0.16, base_y + avail_h * 0.16));
+                    let mut x_anchors = Vec::with_capacity(12);
+                    if !open_left {
+                        for col in 0..5 {
+                            let cx = h_bbox.min_x + clearance + (col as f64) * (pw + clearance);
+                            let fits = if open_right {
+                                cx + pw * 0.42 <= h_bbox.max_x + 1e-4
+                            } else {
+                                cx + pw <= h_bbox.max_x - clearance + 1e-4
+                            };
+                            if fits {
+                                x_anchors.push(cx);
+                            } else {
+                                break;
+                            }
                         }
-                        if avail_h > 10.0 {
-                            candidate_points.push(Point::new(mid_x, base_y + avail_h * 0.16));
+                    }
+                    if !open_right {
+                        for col in 0..5 {
+                            let cx = h_bbox.max_x - clearance - pw - (col as f64) * (pw + clearance);
+                            let fits = if open_left {
+                                cx + pw * 0.58 >= h_bbox.min_x - 1e-4
+                            } else {
+                                cx >= h_bbox.min_x + clearance - 1e-4
+                            };
+                            if fits {
+                                x_anchors.push(cx);
+                            } else {
+                                break;
+                            }
                         }
+                    }
+                    let mid_x = h_bbox.min_x + (h_bbox.width() - pw) * 0.5;
+                    if (!open_left || mid_x >= h_bbox.min_x + clearance - 1e-4)
+                        && (!open_right || mid_x + pw <= h_bbox.max_x - clearance + 1e-4)
+                    {
+                        x_anchors.push(mid_x);
+                    }
 
-                        // Touching anchors against shapes already placed inside this hole
-                        for inner in &self.placed {
-                            if inner.bbox.min_x >= h_bbox.min_x - 2.0 && inner.bbox.max_x <= h_bbox.max_x + 2.0
-                                && inner.bbox.min_y >= h_bbox.min_y - 2.0 && inner.bbox.max_y <= h_bbox.max_y + 2.0
-                            {
-                                let rx = inner.x + inner.width + clearance;
-                                let ty = inner.y + inner.height + clearance;
-                                candidate_points.push(Point::new(inner.x, ty));
-                                candidate_points.push(Point::new(base_x, ty));
-                                candidate_points.push(Point::new(rx, inner.y));
-                                candidate_points.push(Point::new(rx, base_y));
-                                candidate_points.push(Point::new(rx, mid_y));
-                                candidate_points.push(Point::new(mid_x, ty));
+                    let mut y_anchors = Vec::with_capacity(12);
+                    if !open_bottom {
+                        for row in 0..5 {
+                            let cy = h_bbox.min_y + clearance + (row as f64) * (ph + clearance);
+                            let fits = if open_top {
+                                cy + ph * 0.42 <= h_bbox.max_y + 1e-4
+                            } else {
+                                cy + ph <= h_bbox.max_y - clearance + 1e-4
+                            };
+                            if fits {
+                                y_anchors.push(cy);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if !open_top {
+                        for row in 0..5 {
+                            let cy = h_bbox.max_y - clearance - ph - (row as f64) * (ph + clearance);
+                            let fits = if open_bottom {
+                                cy + ph * 0.58 >= h_bbox.min_y - 1e-4
+                            } else {
+                                cy >= h_bbox.min_y + clearance - 1e-4
+                            };
+                            if fits {
+                                y_anchors.push(cy);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let mid_y = h_bbox.min_y + (h_bbox.height() - ph) * 0.5;
+                    if (!open_bottom || mid_y >= h_bbox.min_y + clearance - 1e-4)
+                        && (!open_top || mid_y + ph <= h_bbox.max_y - clearance + 1e-4)
+                    {
+                        y_anchors.push(mid_y);
+                    }
+
+                    for inner in &self.placed {
+                        if std::ptr::eq(inner, shape) {
+                            continue;
+                        }
+                        if inner.bbox.max_x > h_bbox.min_x + 1.0
+                            && inner.bbox.min_x < h_bbox.max_x - 1.0
+                            && inner.bbox.max_y > h_bbox.min_y + 1.0
+                            && inner.bbox.min_y < h_bbox.max_y - 1.0
+                        {
+                            x_anchors.push(inner.x + inner.width + clearance);
+                            x_anchors.push(inner.x - pw - clearance);
+                            y_anchors.push(inner.y + inner.height + clearance);
+                            y_anchors.push(inner.y - ph - clearance);
+                            x_anchors.push(inner.x);
+                            y_anchors.push(inner.y);
+                        }
+                    }
+
+                    for &cx in &x_anchors {
+                        for &cy in &y_anchors {
+                            let cand_bbox = Rect {
+                                min_x: cx,
+                                min_y: cy,
+                                max_x: cx + pw,
+                                max_y: cy + ph,
+                            };
+                            let in_closed_bbox = cand_bbox.min_x >= h_bbox.min_x + clearance - 1e-4
+                                && cand_bbox.max_x <= h_bbox.max_x - clearance + 1e-4
+                                && cand_bbox.min_y >= h_bbox.min_y + clearance - 1e-4
+                                && cand_bbox.max_y <= h_bbox.max_y - clearance + 1e-4;
+                            let in_open_pocket = Self::polygon_in_open_mouth_hole(
+                                norm_poly,
+                                &cand_bbox,
+                                is_rect,
+                                hole,
+                                &shape.bbox,
+                                clearance,
+                            );
+                            if in_closed_bbox || in_open_pocket {
+                                candidate_points.push(Point::new(cx, cy));
                             }
                         }
                     }
@@ -556,28 +724,30 @@ impl SheetContext {
             ) {
                 let mut fx = pt.x;
                 let mut fy = pt.y;
-                let mut step_x = if pull_right { 16.0 } else { -16.0 };
-                for _ in 0..4 {
-                    let nx = (fx + step_x).clamp(bounds.min_x, bounds.max_x - pw);
-                    if (nx - fx).abs() > 0.2 && self.can_place_precomputed(
-                        norm_poly, dilated_poly, dilated_bbox, is_rect,
-                        nx, fy, candidate_small_part, candidate_small_part_clearance,
-                    ) {
-                        fx = nx;
-                    } else {
-                        step_x *= 0.5;
+                if !is_rect {
+                    let mut step_x = if pull_right { 16.0 } else { -16.0 };
+                    for _ in 0..4 {
+                        let nx = (fx + step_x).clamp(bounds.min_x, bounds.max_x - pw);
+                        if (nx - fx).abs() > 0.2 && self.can_place_precomputed(
+                            norm_poly, dilated_poly, dilated_bbox, is_rect,
+                            nx, fy, candidate_small_part, candidate_small_part_clearance,
+                        ) {
+                            fx = nx;
+                        } else {
+                            step_x *= 0.5;
+                        }
                     }
-                }
-                let mut step_y = if pull_top { 16.0 } else { -16.0 };
-                for _ in 0..4 {
-                    let ny = (fy + step_y).clamp(bounds.min_y, bounds.max_y - ph);
-                    if (ny - fy).abs() > 0.2 && self.can_place_precomputed(
-                        norm_poly, dilated_poly, dilated_bbox, is_rect,
-                        fx, ny, candidate_small_part, candidate_small_part_clearance,
-                    ) {
-                        fy = ny;
-                    } else {
-                        step_y *= 0.5;
+                    let mut step_y = if pull_top { 16.0 } else { -16.0 };
+                    for _ in 0..4 {
+                        let ny = (fy + step_y).clamp(bounds.min_y, bounds.max_y - ph);
+                        if (ny - fy).abs() > 0.2 && self.can_place_precomputed(
+                            norm_poly, dilated_poly, dilated_bbox, is_rect,
+                            fx, ny, candidate_small_part, candidate_small_part_clearance,
+                        ) {
+                            fy = ny;
+                        } else {
+                            step_y *= 0.5;
+                        }
                     }
                 }
                 let final_pt = Point::new(fx, fy);

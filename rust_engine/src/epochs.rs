@@ -146,10 +146,21 @@ pub fn consolidate_sheets(
                         let dilated_poly = crate::geometry::offset_polygon(&norm_poly, spacing * 0.5);
                         let dilated_bbox = dilated_poly.bounding_box();
 
-                        if let Some((px, py, _)) = ctx.find_best_anchor(
-                            &norm_poly, &dilated_poly, &dilated_bbox, is_rect,
-                            p.small_part.unwrap_or(false), p.small_part_clearance.unwrap_or(0.0), 1.0,
-                        ) {
+                        let best_pos = if sheet_in_sheet && ctx.has_holes_or_pockets() {
+                            ctx.find_best_hole_or_pocket_anchor(
+                                &norm_poly, &dilated_poly, &dilated_bbox, is_rect,
+                                p.small_part.unwrap_or(false), p.small_part_clearance.unwrap_or(0.0), 1.0, true,
+                            ).or_else(|| ctx.find_best_anchor(
+                                &norm_poly, &dilated_poly, &dilated_bbox, is_rect,
+                                p.small_part.unwrap_or(false), p.small_part_clearance.unwrap_or(0.0), 1.0,
+                            ))
+                        } else {
+                            ctx.find_best_anchor(
+                                &norm_poly, &dilated_poly, &dilated_bbox, is_rect,
+                                p.small_part.unwrap_or(false), p.small_part_clearance.unwrap_or(0.0), 1.0,
+                            )
+                        };
+                        if let Some((px, py, _)) = best_pos {
                             ctx.add_placed(
                                 norm_poly.clone(), norm_holes.clone(), px, py, new_rot,
                                 p.small_part.unwrap_or(false), p.small_part_clearance.unwrap_or(0.0),
@@ -252,6 +263,533 @@ fn prioritize_two_sided_sheets(sheets: &mut Vec<SheetOutput>) {
     }
 }
 
+fn collect_placed_source_keys(sheets: &[SheetOutput]) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for s in sheets {
+        for p in &s.placements {
+            if !p.entity_id.is_empty() {
+                keys.insert(format!("e:{}", p.entity_id));
+            }
+            if !p.id.is_empty() {
+                keys.insert(format!("i:{}", p.id));
+            }
+            if let Some(children) = &p.manual_cluster_children {
+                for c in children {
+                    if let Some(eid) = &c.entity_id {
+                        if !eid.is_empty() {
+                            keys.insert(format!("e:{}", eid));
+                        }
+                    }
+                    if let Some(pid) = &c.id {
+                        if !pid.is_empty() {
+                            keys.insert(format!("i:{}", pid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn is_part_in_placed_keys(part: &crate::types::PartInput, keys: &std::collections::BTreeSet<String>) -> bool {
+    if let Some(eid) = &part.entity_id {
+        if !eid.is_empty() && keys.contains(&format!("e:{}", eid)) {
+            return true;
+        }
+    }
+    if let Some(pid) = &part.id {
+        if !pid.is_empty() && keys.contains(&format!("i:{}", pid)) {
+            return true;
+        }
+    }
+    if let Some(children) = &part.manual_cluster_children {
+        if !children.is_empty() && children.iter().all(|c| {
+            c.entity_id.as_ref().map_or(false, |e| !e.is_empty() && keys.contains(&format!("e:{}", e)))
+                || c.id.as_ref().map_or(false, |i| !i.is_empty() && keys.contains(&format!("i:{}", i)))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn pack_sub_state_best(
+    sub_state: &MaterialStateInput,
+    strategies: &[usize],
+    global_rot_div: usize,
+    sheet_in_sheet: bool,
+    compact_directions: &[String],
+) -> LayoutOutput {
+    let config = sub_state.configuration.clone().unwrap_or_default();
+    let part_spacing = config.part_spacing.or(config.cut_gap).unwrap_or(6.0);
+    let existing_macro_count = sub_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
+    let (paired_parts, new_comb_count) = if existing_macro_count > 0 {
+        (sub_state.parts.clone(), 0)
+    } else {
+        crate::macro_comb::pair_comb_parts(&sub_state.parts, &config, part_spacing)
+    };
+    let comb_count = existing_macro_count + new_comb_count;
+    let prepared = crate::packing::prepare_parts(&paired_parts, &config, part_spacing);
+
+    let mut best: Option<LayoutOutput> = None;
+    for &strat_id in strategies {
+        let mut cand = crate::packing::pack_material_with_prepared(sub_state, &prepared, comb_count, strat_id);
+        consolidate_sheets(&mut cand, global_rot_div, sheet_in_sheet, compact_directions);
+        prioritize_two_sided_sheets(&mut cand.sheets);
+        match &best {
+            None => best = Some(cand),
+            Some(curr) => {
+                if LayoutScore::compute(&cand) < LayoutScore::compute(curr) {
+                    best = Some(cand);
+                }
+            }
+        }
+    }
+    best.unwrap_or_else(|| crate::packing::pack_material_with_prepared(sub_state, &prepared, comb_count, 0))
+}
+
+fn pack_sub_state_parallel(
+    sub_state: &MaterialStateInput,
+    strategies: &[usize],
+    global_rot_div: usize,
+    sheet_in_sheet: bool,
+    compact_directions: &[String],
+) -> LayoutOutput {
+    let config = sub_state.configuration.clone().unwrap_or_default();
+    let part_spacing = config.part_spacing.or(config.cut_gap).unwrap_or(6.0);
+    let existing_macro_count = sub_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
+    let (paired_parts, new_comb_count) = if existing_macro_count > 0 {
+        (sub_state.parts.clone(), 0)
+    } else {
+        crate::macro_comb::pair_comb_parts(&sub_state.parts, &config, part_spacing)
+    };
+    let comb_count = existing_macro_count + new_comb_count;
+    let prepared = crate::packing::prepare_parts(&paired_parts, &config, part_spacing);
+
+    let cands: Vec<LayoutOutput> = strategies
+        .par_iter()
+        .map(|&strat_id| {
+            let mut cand = crate::packing::pack_material_with_prepared(sub_state, &prepared, comb_count, strat_id);
+            consolidate_sheets(&mut cand, global_rot_div, sheet_in_sheet, compact_directions);
+            prioritize_two_sided_sheets(&mut cand.sheets);
+            cand
+        })
+        .collect();
+
+    let mut best: Option<LayoutOutput> = None;
+    for cand in cands {
+        match &best {
+            None => best = Some(cand),
+            Some(curr) => {
+                if LayoutScore::compute(&cand) < LayoutScore::compute(curr) {
+                    best = Some(cand);
+                }
+            }
+        }
+    }
+    best.unwrap_or_else(|| crate::packing::pack_material_with_prepared(sub_state, &prepared, comb_count, 0))
+}
+
+#[allow(dead_code)]
+fn try_room_subbatched_layout(
+    material_state: &MaterialStateInput,
+    paired_material_state: &MaterialStateInput,
+    baseline_layout: &LayoutOutput,
+    global_rot_div: usize,
+    sheet_in_sheet: bool,
+    compact_directions: &[String],
+    start_mat: &std::time::Instant,
+) -> Option<LayoutOutput> {
+    use std::collections::BTreeMap;
+
+    if material_state.parts.len() < 2 || baseline_layout.sheets.is_empty() {
+        return None;
+    }
+
+    let mut room_buckets: BTreeMap<String, Vec<crate::types::PartInput>> = BTreeMap::new();
+    let mut unassigned_parts: Vec<crate::types::PartInput> = Vec::new();
+
+    for p in &material_state.parts {
+        let r = crate::types::get_part_room_key(p);
+        if r.is_empty() {
+            unassigned_parts.push(p.clone());
+        } else {
+            room_buckets.entry(r).or_default().push(p.clone());
+        }
+    }
+
+    if room_buckets.len() < 2 {
+        return None;
+    }
+
+    let baseline_sheets = baseline_layout.sheets.len();
+    let baseline_underfilled = LayoutScore::compute(baseline_layout).underfilled_sheets;
+    let mut best_cand = baseline_layout.clone();
+    let mut improved = false;
+
+    let config_obj = material_state.configuration.clone().unwrap_or_default();
+    let part_spacing = config_obj.part_spacing.or(config_obj.cut_gap).unwrap_or(6.0);
+    let board_area = baseline_layout.board_width * baseline_layout.board_height;
+
+    let mut ordered_rooms: Vec<(String, Vec<crate::types::PartInput>, i64)> = room_buckets
+        .into_iter()
+        .map(|(k, parts)| {
+            let area_sum: f64 = parts
+                .iter()
+                .map(|p| p.area.unwrap_or_else(|| Polygon::from_raw(&p.contour).area()))
+                .sum();
+            (k, parts, area_sum.round() as i64)
+        })
+        .collect();
+    ordered_rooms.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut per_room_results: Vec<(String, Vec<crate::types::PartInput>, LayoutOutput)> =
+        Vec::with_capacity(ordered_rooms.len());
+
+    for (r_key, r_parts, _area) in ordered_rooms {
+        let (paired_r_parts, _) = crate::macro_comb::pair_comb_parts(&r_parts, &config_obj, part_spacing);
+        let mut r_state = material_state.clone();
+        r_state.parts = paired_r_parts;
+        let r_layout = pack_sub_state_best(&r_state, &[0, 1, 2, 4], global_rot_div, sheet_in_sheet, compact_directions);
+        per_room_results.push((r_key, r_parts, r_layout));
+    }
+
+    for lock_mode in [0usize, 1usize] {
+        if start_mat.elapsed().as_secs_f64() >= 9.4 {
+            break;
+        }
+        let mut locked_sheets: Vec<SheetOutput> = Vec::new();
+        let mut tail_pool: Vec<crate::types::PartInput> = Vec::new();
+
+        for (_r_key, r_orig_parts, r_layout) in &per_room_results {
+            let s_len = r_layout.sheets.len();
+            let keep_count = if s_len > 1 {
+                s_len - 1
+            } else if s_len == 1 && lock_mode == 0 && r_layout.sheets[0].used_percent >= 78.0 {
+                1
+            } else {
+                0
+            };
+
+            if keep_count > 0 {
+                let kept_slice = &r_layout.sheets[0..keep_count];
+                for s in kept_slice {
+                    locked_sheets.push(s.clone());
+                }
+                let placed_keys = collect_placed_source_keys(kept_slice);
+                for orig_p in r_orig_parts {
+                    if !is_part_in_placed_keys(orig_p, &placed_keys) {
+                        tail_pool.push(orig_p.clone());
+                    }
+                }
+            } else {
+                for orig_p in r_orig_parts {
+                    tail_pool.push(orig_p.clone());
+                }
+            }
+        }
+
+        for u_p in &unassigned_parts {
+            tail_pool.push(u_p.clone());
+        }
+
+        let mut merged_sheets = locked_sheets.clone();
+        if !tail_pool.is_empty() {
+            let (paired_tail, _) = crate::macro_comb::pair_comb_parts(&tail_pool, &config_obj, part_spacing);
+            let mut tail_state = material_state.clone();
+            tail_state.parts = paired_tail;
+            let tail_layout = pack_sub_state_best(
+                &tail_state,
+                &[100, 101, 0, 1, 4],
+                global_rot_div,
+                sheet_in_sheet,
+                compact_directions,
+            );
+            for ts in &tail_layout.sheets {
+                merged_sheets.push(ts.clone());
+            }
+        }
+
+        for (idx, s) in merged_sheets.iter_mut().enumerate() {
+            s.index = idx + 1;
+            let used_area: f64 = s.placements.iter().map(|p| p.area).sum();
+            let util = if board_area > 0.0 { (used_area / board_area) * 100.0 } else { 0.0 };
+            s.utilization = (util * 10.0).round() / 10.0;
+            s.used_percent = (util * 10.0).round() / 10.0;
+        }
+
+        let mut cand_layout = baseline_layout.clone();
+        cand_layout.sheets = merged_sheets;
+        consolidate_sheets(&mut cand_layout, global_rot_div, sheet_in_sheet, compact_directions);
+        prioritize_two_sided_sheets(&mut cand_layout.sheets);
+
+        if crate::scoring::is_room_candidate_better(&cand_layout, &best_cand, baseline_sheets, baseline_underfilled) {
+            best_cand = cand_layout.clone();
+            improved = true;
+        }
+
+        if cand_layout.sheets.len() > baseline_sheets && !locked_sheets.is_empty() && !tail_pool.is_empty() {
+            let mut backfill_layout = cand_layout;
+            while backfill_layout.sheets.len() > locked_sheets.len() {
+                if !consolidate_sheets(&mut backfill_layout, global_rot_div, sheet_in_sheet, compact_directions) {
+                    break;
+                }
+            }
+            if backfill_layout.sheets.len() > locked_sheets.len() + 1 {
+                let lead_slice = &backfill_layout.sheets[0..locked_sheets.len()];
+                let absorbed_keys = collect_placed_source_keys(lead_slice);
+                let mut rem_tail_parts = Vec::new();
+                for tp in &tail_pool {
+                    if !is_part_in_placed_keys(tp, &absorbed_keys) {
+                        rem_tail_parts.push(tp.clone());
+                    }
+                }
+                if !rem_tail_parts.is_empty() && rem_tail_parts.len() < tail_pool.len() {
+                    let (paired_rem, _) = crate::macro_comb::pair_comb_parts(&rem_tail_parts, &config_obj, part_spacing);
+                    let mut rem_state = material_state.clone();
+                    rem_state.parts = paired_rem;
+                    let rem_layout = pack_sub_state_best(
+                        &rem_state,
+                        &[100, 0, 1],
+                        global_rot_div,
+                        sheet_in_sheet,
+                        compact_directions,
+                    );
+                    let mut rebuilt = lead_slice.to_vec();
+                    for rs in rem_layout.sheets {
+                        rebuilt.push(rs);
+                    }
+                    for (idx, s) in rebuilt.iter_mut().enumerate() {
+                        s.index = idx + 1;
+                    }
+                    backfill_layout.sheets = rebuilt;
+                    consolidate_sheets(&mut backfill_layout, global_rot_div, sheet_in_sheet, compact_directions);
+                    prioritize_two_sided_sheets(&mut backfill_layout.sheets);
+                }
+            }
+            if crate::scoring::is_room_candidate_better(&backfill_layout, &best_cand, baseline_sheets, baseline_underfilled) {
+                best_cand = backfill_layout;
+                improved = true;
+            }
+        }
+    }
+
+    if start_mat.elapsed().as_secs_f64() < 9.2 {
+        for strat_id in [100usize, 101, 102, 104] {
+            if start_mat.elapsed().as_secs_f64() >= 9.5 {
+                break;
+            }
+            let mut aff_layout = pack_material(paired_material_state, strat_id);
+            consolidate_sheets(&mut aff_layout, global_rot_div, sheet_in_sheet, compact_directions);
+            prioritize_two_sided_sheets(&mut aff_layout.sheets);
+            if crate::scoring::is_room_candidate_better(&aff_layout, &best_cand, baseline_sheets, baseline_underfilled) {
+                best_cand = aff_layout;
+                improved = true;
+            }
+        }
+    }
+
+    if improved {
+        Some(best_cand)
+    } else {
+        None
+    }
+}
+
+fn try_room_subbatched_layout_fast(
+    _material_state: &MaterialStateInput,
+    paired_material_state: &MaterialStateInput,
+    baseline_layout: &LayoutOutput,
+    global_rot_div: usize,
+    sheet_in_sheet: bool,
+    compact_directions: &[String],
+    start_mat: &std::time::Instant,
+) -> Option<LayoutOutput> {
+    use std::collections::BTreeMap;
+
+    if paired_material_state.parts.len() < 2 || baseline_layout.sheets.is_empty() {
+        return None;
+    }
+
+    let mut room_buckets: BTreeMap<String, Vec<crate::types::PartInput>> = BTreeMap::new();
+    let mut unassigned_parts: Vec<crate::types::PartInput> = Vec::new();
+
+    for p in &paired_material_state.parts {
+        let r = crate::types::get_part_room_key(p);
+        if r.is_empty() {
+            unassigned_parts.push(p.clone());
+        } else {
+            room_buckets.entry(r).or_default().push(p.clone());
+        }
+    }
+
+    if room_buckets.len() < 2 {
+        return None;
+    }
+
+    let baseline_sheets = baseline_layout.sheets.len();
+    let baseline_underfilled = LayoutScore::compute(baseline_layout).underfilled_sheets;
+    let mut best_cand = baseline_layout.clone();
+    let mut improved = false;
+    let board_area = baseline_layout.board_width * baseline_layout.board_height;
+
+    let mut ordered_rooms: Vec<(String, Vec<crate::types::PartInput>, i64)> = room_buckets
+        .into_iter()
+        .map(|(k, parts)| {
+            let area_sum: f64 = parts
+                .iter()
+                .map(|p| p.area.unwrap_or_else(|| Polygon::from_raw(&p.contour).area()))
+                .sum();
+            (k, parts, area_sum.round() as i64)
+        })
+        .collect();
+    ordered_rooms.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    let per_room_results: Vec<(String, Vec<crate::types::PartInput>, LayoutOutput)> = ordered_rooms
+        .into_par_iter()
+        .map(|(r_key, r_parts, _area)| {
+            let mut r_state = paired_material_state.clone();
+            r_state.parts = r_parts.clone();
+            let r_layout = pack_sub_state_best(&r_state, &[0, 1], global_rot_div, sheet_in_sheet, compact_directions);
+            (r_key, r_parts, r_layout)
+        })
+        .collect();
+
+    let has_single_dense_room = per_room_results
+        .iter()
+        .any(|(_, _, r_layout)| r_layout.sheets.len() == 1 && r_layout.sheets[0].used_percent >= 78.0);
+
+    for lock_mode in [0usize, 1usize] {
+        if lock_mode == 1 && (!has_single_dense_room || (improved && best_cand.sheets.len() <= baseline_sheets)) {
+            break;
+        }
+        if start_mat.elapsed().as_secs_f64() >= 9.4 {
+            break;
+        }
+        let mut locked_sheets: Vec<SheetOutput> = Vec::new();
+        let mut tail_pool: Vec<crate::types::PartInput> = Vec::new();
+
+        for (_r_key, r_orig_parts, r_layout) in &per_room_results {
+            let s_len = r_layout.sheets.len();
+            let keep_count = if s_len > 1 {
+                s_len - 1
+            } else if s_len == 1 && lock_mode == 0 && r_layout.sheets[0].used_percent >= 78.0 {
+                1
+            } else {
+                0
+            };
+
+            if keep_count > 0 {
+                let kept_slice = &r_layout.sheets[0..keep_count];
+                for s in kept_slice {
+                    locked_sheets.push(s.clone());
+                }
+                let placed_keys = collect_placed_source_keys(kept_slice);
+                for orig_p in r_orig_parts {
+                    if !is_part_in_placed_keys(orig_p, &placed_keys) {
+                        tail_pool.push(orig_p.clone());
+                    }
+                }
+            } else {
+                for orig_p in r_orig_parts {
+                    tail_pool.push(orig_p.clone());
+                }
+            }
+        }
+
+        for u_p in &unassigned_parts {
+            tail_pool.push(u_p.clone());
+        }
+
+        let mut merged_sheets = locked_sheets.clone();
+        if !tail_pool.is_empty() {
+            let mut tail_state = paired_material_state.clone();
+            tail_state.parts = tail_pool.clone();
+            let tail_layout = pack_sub_state_parallel(
+                &tail_state,
+                &[100, 0],
+                global_rot_div,
+                sheet_in_sheet,
+                compact_directions,
+            );
+            for ts in &tail_layout.sheets {
+                merged_sheets.push(ts.clone());
+            }
+        }
+
+        for (idx, s) in merged_sheets.iter_mut().enumerate() {
+            s.index = idx + 1;
+            let used_area: f64 = s.placements.iter().map(|p| p.area).sum();
+            let util = if board_area > 0.0 { (used_area / board_area) * 100.0 } else { 0.0 };
+            s.utilization = (util * 10.0).round() / 10.0;
+            s.used_percent = (util * 10.0).round() / 10.0;
+        }
+
+        let mut cand_layout = baseline_layout.clone();
+        cand_layout.sheets = merged_sheets;
+        if cand_layout.sheets.len() > baseline_sheets {
+            consolidate_sheets(&mut cand_layout, global_rot_div, sheet_in_sheet, compact_directions);
+        }
+        prioritize_two_sided_sheets(&mut cand_layout.sheets);
+
+        if crate::scoring::is_room_candidate_better(&cand_layout, &best_cand, baseline_sheets, baseline_underfilled) {
+            best_cand = cand_layout.clone();
+            improved = true;
+        }
+
+        if cand_layout.sheets.len() > baseline_sheets && !locked_sheets.is_empty() && !tail_pool.is_empty() {
+            let mut backfill_layout = cand_layout;
+            while backfill_layout.sheets.len() > locked_sheets.len() {
+                if !consolidate_sheets(&mut backfill_layout, global_rot_div, sheet_in_sheet, compact_directions) {
+                    break;
+                }
+            }
+            if backfill_layout.sheets.len() > locked_sheets.len() + 1 {
+                let lead_slice = &backfill_layout.sheets[0..locked_sheets.len()];
+                let absorbed_keys = collect_placed_source_keys(lead_slice);
+                let mut rem_tail_parts = Vec::new();
+                for tp in &tail_pool {
+                    if !is_part_in_placed_keys(tp, &absorbed_keys) {
+                        rem_tail_parts.push(tp.clone());
+                    }
+                }
+                if !rem_tail_parts.is_empty() && rem_tail_parts.len() < tail_pool.len() {
+                    let mut rem_state = paired_material_state.clone();
+                    rem_state.parts = rem_tail_parts;
+                    let rem_layout = pack_sub_state_parallel(
+                        &rem_state,
+                        &[100, 0],
+                        global_rot_div,
+                        sheet_in_sheet,
+                        compact_directions,
+                    );
+                    let mut rebuilt = lead_slice.to_vec();
+                    for rs in rem_layout.sheets {
+                        rebuilt.push(rs);
+                    }
+                    for (idx, s) in rebuilt.iter_mut().enumerate() {
+                        s.index = idx + 1;
+                    }
+                    backfill_layout.sheets = rebuilt;
+                    consolidate_sheets(&mut backfill_layout, global_rot_div, sheet_in_sheet, compact_directions);
+                    prioritize_two_sided_sheets(&mut backfill_layout.sheets);
+                }
+            }
+            if crate::scoring::is_room_candidate_better(&backfill_layout, &best_cand, baseline_sheets, baseline_underfilled) {
+                best_cand = backfill_layout;
+                improved = true;
+            }
+        }
+    }
+
+    if improved {
+        Some(best_cand)
+    } else {
+        None
+    }
+}
+
 pub fn optimize_material_layout<F>(
     material_state: &MaterialStateInput,
     mut on_progress: F,
@@ -268,20 +806,40 @@ where
     let part_spacing = config_obj.part_spacing.or(config_obj.cut_gap).unwrap_or(6.0);
 
     // Phase 1: Pre-pair comb parts into rectangular macros ONCE for the entire material
-    let (paired_parts, _comb_count) = crate::macro_comb::pair_comb_parts(
+    let existing_macro_count = material_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
+    let (paired_parts, new_comb_count) = crate::macro_comb::pair_comb_parts(
         &material_state.parts,
         &config_obj,
         part_spacing,
     );
+    let comb_count = existing_macro_count + new_comb_count;
     let mut paired_material_state = material_state.clone();
     paired_material_state.parts = paired_parts;
     let total_parts = paired_material_state.parts.len();
     let start_mat = std::time::Instant::now();
+    let prepared_parts = crate::packing::prepare_parts(&paired_material_state.parts, &config_obj, part_spacing);
+    let has_complex_shapes = comb_count > 0 || prepared_parts.iter().any(|p| p.is_irregular || !p.variants[0].norm_holes.is_empty());
+
+    let has_multi_rooms = {
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &paired_material_state.parts {
+            let r = crate::types::get_part_room_key(p);
+            if !r.is_empty() {
+                seen.insert(r);
+                if seen.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        seen.len() >= 2
+    };
 
     // 1. Initial baseline with progressive sheet-by-sheet live streaming
     let mut progressive_sheet = 0;
-    let mut initial_layout = pack_material_streaming(
+    let mut initial_layout = crate::packing::pack_material_streaming_with_prepared(
         &paired_material_state,
+        &prepared_parts,
+        comb_count,
         0,
         Some(|snap: &LayoutOutput| {
             progressive_sheet = snap.sheets.len();
@@ -308,14 +866,23 @@ where
         (num_threads * 2).clamp(16, 32)
     } else if baseline_elapsed > 4.0 {
         2.min(num_threads)
+    } else if best_layout.sheets.len() <= 1 && !has_complex_shapes && !has_multi_rooms {
+        4.min(num_threads)
     } else {
         num_threads.clamp(6, 16)
     };
 
     if num_strategies > 0 && baseline_elapsed < 8.0 {
         let (tx, rx) = std::sync::mpsc::channel();
-        (1..=num_strategies).into_par_iter().for_each_with(tx, |s, strategy_id| {
-            let mut layout = pack_material(&paired_material_state, strategy_id);
+        (1..=num_strategies).into_par_iter().for_each_with(tx, |s, idx| {
+            let strategy_id = if has_multi_rooms && num_strategies >= 4 && idx == num_strategies - 1 {
+                100
+            } else if has_multi_rooms && num_strategies >= 4 && idx == num_strategies {
+                101
+            } else {
+                idx
+            };
+            let mut layout = crate::packing::pack_material_with_prepared(&paired_material_state, &prepared_parts, comb_count, strategy_id);
             consolidate_sheets(&mut layout, global_rot_div, sheet_in_sheet, &compact_directions);
             let _ = s.send((strategy_id, layout));
         });
@@ -341,6 +908,18 @@ where
     // 3. Final consolidation & scoring
     consolidate_sheets(&mut best_layout, global_rot_div, sheet_in_sheet, &compact_directions);
     prioritize_two_sided_sheets(&mut best_layout.sheets);
+
+    if let Some(room_layout) = try_room_subbatched_layout_fast(
+        material_state,
+        &paired_material_state,
+        &best_layout,
+        global_rot_div,
+        sheet_in_sheet,
+        &compact_directions,
+        &start_mat,
+    ) {
+        best_layout = room_layout;
+    }
 
     let final_score = LayoutScore::compute(&best_layout);
     best_layout.waste_area = final_score.waste_area;

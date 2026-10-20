@@ -85,7 +85,7 @@ pub fn prepare_parts(
     let global_rot_div = config.rotation_divisions.unwrap_or(1);
     let small_part_threshold = config.small_part_threshold.unwrap_or(0.0).max(0.0);
     let configured_small_part_clearance = config.small_part_clearance.unwrap_or(0.0).max(0.0);
-    let mut variant_cache: std::collections::HashMap<u64, (Vec<RotatedVariant>, u64)> = std::collections::HashMap::new();
+    let mut geom_cache: std::collections::HashMap<u64, Vec<(f64, f64, f64, Polygon, Vec<Polygon>, Polygon, Rect, Rect, bool)>> = std::collections::HashMap::new();
 
     parts.iter().map(|p| {
         let poly = Polygon::from_raw(&p.contour);
@@ -102,14 +102,23 @@ pub fn prepare_parts(
         } else {
             0.0
         };
+        let effective_holes: Option<Vec<Vec<[f64; 2]>>> = if p.holes.as_ref().map_or(false, |h| !h.is_empty()) {
+            p.holes.clone()
+        } else if p.manual_cluster_macro == Some(true) {
+            p.manual_cluster_children.as_ref().and_then(|children| {
+                crate::macro_comb::extract_macro_cavity_holes(children, orig_bbox.width(), orig_bbox.height())
+            })
+        } else {
+            None
+        };
         let size_group = SizeGroup::from_dimensions(orig_bbox.width(), orig_bbox.height());
         let is_two_sided = p.two_sided.unwrap_or(false)
             || (p.manual_cluster_macro == Some(true) && p.manual_cluster_children.as_ref().map_or(false, |children| {
                 children.iter().any(|c| c.two_sided == Some(true))
             }));
-        let is_anchor = p.holes.as_ref().map_or(false, |h| !h.is_empty()) || !poly.is_rectangular();
+        let is_anchor = effective_holes.as_ref().map_or(false, |h| !h.is_empty()) || !poly.is_rectangular();
         let is_irregular = !poly.is_rectangular();
-        let is_rect = poly.is_rectangular() && p.holes.as_ref().map_or(true, |h| h.is_empty());
+        let is_rect = poly.is_rectangular() && effective_holes.as_ref().map_or(true, |h| h.is_empty());
 
         let has_child_grain = p.manual_cluster_macro == Some(true) && p.manual_cluster_children.as_ref().map_or(false, |children| {
             children.iter().any(|c| c.has_grain_label == Some(true) || c.grain_arrow_degrees.is_some() || c.base_rotation_degrees.is_some())
@@ -161,7 +170,6 @@ pub fn prepare_parts(
             }
         }
 
-        let has_layers = p.draw_layers.as_ref().map_or(false, |l| !l.is_empty());
         let raw_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -172,7 +180,7 @@ pub fn prepare_parts(
                 ((pt[0] * 100.0).round() as i64).hash(&mut h);
                 ((pt[1] * 100.0).round() as i64).hash(&mut h);
             }
-            if let Some(holes) = &p.holes {
+            if let Some(holes) = &effective_holes {
                 holes.len().hash(&mut h);
                 for hole in holes {
                     hole.len().hash(&mut h);
@@ -188,113 +196,92 @@ pub fn prepare_parts(
             h.finish()
         };
 
-        let (final_variants, shape_key) = if !has_layers && variant_cache.contains_key(&raw_key) {
-            variant_cache.get(&raw_key).unwrap().clone()
-        } else {
-            let variants: Vec<RotatedVariant> = allowed_rotations.iter().map(|&rot| {
-                let rad = rot * std::f64::consts::PI / 180.0;
-                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-                let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
-                let bbox = norm_poly.bounding_box();
-                let norm_holes: Vec<Polygon> = p.holes.as_ref().map_or(Vec::new(), |holes_vec| {
-                    holes_vec.iter().map(|raw_h| {
-                        let h_poly = Polygon::from_raw(raw_h);
-                        let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-                        h_rot.translate(shift_x, shift_y)
-                    }).collect()
-                });
-                let norm_layers: Vec<DrawLayerData> = p.draw_layers.as_ref().map_or(Vec::new(), |layers| {
-                    layers.iter().map(|layer| {
-                        let norm_paths = layer.paths.as_ref().map_or(Vec::new(), |paths| {
-                            paths.iter().map(|path| {
-                                let rot_pts = path.points.iter().map(|pt_raw| {
-                                    let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
-                                    [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
-                                }).collect();
-                                DrawPathData {
-                                    points: rot_pts,
-                                    closed: path.closed,
-                                    surface_face: path.surface_face,
-                                    surface_face_id: path.surface_face_id.clone(),
-                                    surface_loop_type: path.surface_loop_type.clone(),
-                                    geometry_kind: path.geometry_kind.clone(),
-                                    _nesting_packed_local: Some(true),
-                                }
-                            }).collect()
-                        });
-                        DrawLayerData {
-                            name: layer.name.clone(),
-                            layer_name: layer.layer_name.clone(),
-                            color: layer.color.clone(),
-                            side: layer.side.clone(),
-                            r#type: layer.r#type.clone(),
-                            paths: Some(norm_paths),
-                        }
-                    }).collect()
-                });
-                let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
-                let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
-                let dilated_bbox = dilated_poly.bounding_box();
-                RotatedVariant { rotation: rot, norm_poly, norm_holes, norm_layers, dilated_poly, dilated_bbox, bbox, is_rect }
-            }).filter(|v| v.bbox.width() <= max_bw && v.bbox.height() <= max_bh).collect();
-
-            let fv = if variants.is_empty() {
-                let rot = allowed_rotations[0];
-                let rad = rot * std::f64::consts::PI / 180.0;
-                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-                let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
-                let bbox = norm_poly.bounding_box();
-                let norm_holes: Vec<Polygon> = p.holes.as_ref().map_or(Vec::new(), |holes_vec| {
-                    holes_vec.iter().map(|raw_h| {
-                        let h_poly = Polygon::from_raw(raw_h);
-                        let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
-                        h_rot.translate(shift_x, shift_y)
-                    }).collect()
-                });
-                let norm_layers: Vec<DrawLayerData> = p.draw_layers.as_ref().map_or(Vec::new(), |layers| {
-                    layers.iter().map(|layer| {
-                        let norm_paths = layer.paths.as_ref().map_or(Vec::new(), |paths| {
-                            paths.iter().map(|path| {
-                                let rot_pts = path.points.iter().map(|pt_raw| {
-                                    let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
-                                    [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
-                                }).collect();
-                                DrawPathData {
-                                    points: rot_pts,
-                                    closed: path.closed,
-                                    surface_face: path.surface_face,
-                                    surface_face_id: path.surface_face_id.clone(),
-                                    surface_loop_type: path.surface_loop_type.clone(),
-                                    geometry_kind: path.geometry_kind.clone(),
-                                    _nesting_packed_local: Some(true),
-                                }
-                            }).collect()
-                        });
-                        DrawLayerData {
-                            name: layer.name.clone(),
-                            layer_name: layer.layer_name.clone(),
-                            color: layer.color.clone(),
-                            side: layer.side.clone(),
-                            r#type: layer.r#type.clone(),
-                            paths: Some(norm_paths),
-                        }
-                    }).collect()
-                });
-                let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
-                let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
-                let dilated_bbox = dilated_poly.bounding_box();
-                vec![RotatedVariant { rotation: rot, norm_poly, norm_holes, norm_layers, dilated_poly, dilated_bbox, bbox, is_rect }]
-            } else {
-                variants
-            };
-            if !has_layers {
-                variant_cache.insert(raw_key, (fv.clone(), raw_key));
-            }
-            (fv, raw_key)
+        let rotate_layers_for = |rot: f64, shift_x: f64, shift_y: f64| -> Vec<DrawLayerData> {
+            let rad = rot * std::f64::consts::PI / 180.0;
+            p.draw_layers.as_ref().map_or(Vec::new(), |layers| {
+                layers.iter().map(|layer| {
+                    let norm_paths = layer.paths.as_ref().map_or(Vec::new(), |paths| {
+                        paths.iter().map(|path| {
+                            let rot_pts = path.points.iter().map(|pt_raw| {
+                                let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
+                                [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
+                            }).collect();
+                            DrawPathData {
+                                points: rot_pts,
+                                closed: path.closed,
+                                surface_face: path.surface_face,
+                                surface_face_id: path.surface_face_id.clone(),
+                                surface_loop_type: path.surface_loop_type.clone(),
+                                geometry_kind: path.geometry_kind.clone(),
+                                _nesting_packed_local: Some(true),
+                            }
+                        }).collect()
+                    });
+                    DrawLayerData {
+                        name: layer.name.clone(),
+                        layer_name: layer.layer_name.clone(),
+                        color: layer.color.clone(),
+                        side: layer.side.clone(),
+                        r#type: layer.r#type.clone(),
+                        paths: Some(norm_paths),
+                    }
+                }).collect()
+            })
         };
 
+        let cached_geoms = if let Some(cg) = geom_cache.get(&raw_key) {
+            cg.clone()
+        } else {
+            let mut geoms: Vec<(f64, f64, f64, Polygon, Vec<Polygon>, Polygon, Rect, Rect, bool)> = allowed_rotations.iter().map(|&rot| {
+                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
+                let bbox = norm_poly.bounding_box();
+                let norm_holes: Vec<Polygon> = effective_holes.as_ref().map_or(Vec::new(), |holes_vec| {
+                    holes_vec.iter().map(|raw_h| {
+                        let h_poly = Polygon::from_raw(raw_h);
+                        let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                        h_rot.translate(shift_x, shift_y)
+                    }).collect()
+                });
+                let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
+                let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
+                let dilated_bbox = dilated_poly.bounding_box();
+                (rot, shift_x, shift_y, norm_poly, norm_holes, dilated_poly, dilated_bbox, bbox, is_rect)
+            }).filter(|g| g.7.width() <= max_bw && g.7.height() <= max_bh).collect();
+
+            if geoms.is_empty() {
+                let rot = allowed_rotations[0];
+                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
+                let bbox = norm_poly.bounding_box();
+                let norm_holes: Vec<Polygon> = effective_holes.as_ref().map_or(Vec::new(), |holes_vec| {
+                    holes_vec.iter().map(|raw_h| {
+                        let h_poly = Polygon::from_raw(raw_h);
+                        let h_rot = h_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                        h_rot.translate(shift_x, shift_y)
+                    }).collect()
+                });
+                let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
+                let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
+                let dilated_bbox = dilated_poly.bounding_box();
+                geoms.push((rot, shift_x, shift_y, norm_poly, norm_holes, dilated_poly, dilated_bbox, bbox, is_rect));
+            }
+            geom_cache.insert(raw_key, geoms.clone());
+            geoms
+        };
+
+        let final_variants: Vec<RotatedVariant> = cached_geoms.into_iter().map(|(rot, shift_x, shift_y, norm_poly, norm_holes, dilated_poly, dilated_bbox, bbox, is_rect)| {
+            let norm_layers = rotate_layers_for(rot, shift_x, shift_y);
+            RotatedVariant { rotation: rot, norm_poly, norm_holes, norm_layers, dilated_poly, dilated_bbox, bbox, is_rect }
+        }).collect();
+        let shape_key = raw_key;
+        let mut orig_part = p.clone();
+        if orig_part.holes.is_none() && effective_holes.is_some() {
+            orig_part.holes = effective_holes;
+        }
+
         ProcessedPart {
-            original: p.clone(),
+            original: orig_part,
             area,
             size_group,
             is_two_sided,
@@ -317,9 +304,41 @@ pub fn pack_material(
     pack_material_streaming(material_state, strategy_id, None::<fn(&LayoutOutput)>)
 }
 
+pub fn pack_material_with_prepared(
+    material_state: &MaterialStateInput,
+    prepared: &[ProcessedPart],
+    comb_count: usize,
+    strategy_id: usize,
+) -> LayoutOutput {
+    pack_material_streaming_with_prepared(material_state, prepared, comb_count, strategy_id, None::<fn(&LayoutOutput)>)
+}
+
 /// Strict Implementation of MN Priority-Cavity Hybrid V35 (QUY_TRINH_NESTING_CHI_TIET.md)
 pub fn pack_material_streaming<F>(
     material_state: &MaterialStateInput,
+    strategy_id: usize,
+    on_stream: Option<F>,
+) -> LayoutOutput
+where
+    F: FnMut(&LayoutOutput),
+{
+    let config = material_state.configuration.clone().unwrap_or_default();
+    let part_spacing = config.part_spacing.or(config.cut_gap).unwrap_or(6.0);
+    let existing_macro_count = material_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
+    let (paired_parts, new_comb_count) = if existing_macro_count > 0 {
+        (material_state.parts.clone(), 0)
+    } else {
+        crate::macro_comb::pair_comb_parts(&material_state.parts, &config, part_spacing)
+    };
+    let comb_count = existing_macro_count + new_comb_count;
+    let processed = prepare_parts(&paired_parts, &config, part_spacing);
+    pack_material_streaming_with_prepared(material_state, &processed, comb_count, strategy_id, on_stream)
+}
+
+pub fn pack_material_streaming_with_prepared<F>(
+    material_state: &MaterialStateInput,
+    prepared: &[ProcessedPart],
+    comb_count: usize,
     strategy_id: usize,
     mut on_stream: Option<F>,
 ) -> LayoutOutput
@@ -361,15 +380,7 @@ where
         0.0
     };
     let compact_directions = config.compact_directions.clone().unwrap_or_else(|| vec!["left".to_string(), "bottom".to_string()]);
-
-    let existing_macro_count = material_state.parts.iter().filter(|p| p.manual_cluster_macro == Some(true)).count();
-    let (paired_parts, new_comb_count) = if existing_macro_count > 0 {
-        (material_state.parts.clone(), 0)
-    } else {
-        crate::macro_comb::pair_comb_parts(&material_state.parts, &config, part_spacing)
-    };
-    let comb_count = existing_macro_count + new_comb_count;
-    let processed = prepare_parts(&paired_parts, &config, part_spacing);
+    let processed = prepared.to_vec();
 
     // Section IV: Multi-tier Priority Queue Ordering
     // 1. Two-Sided First
@@ -522,7 +533,14 @@ where
         }
     }
 
-    if strategy_id >= 10 || (opt_seed > 0 && strategy_id >= 2) {
+    let is_room_strategy = strategy_id >= 100;
+    let part_rooms: Vec<String> = if is_room_strategy {
+        ordered_parts.iter().map(|p| crate::types::get_part_room_key(&p.original)).collect()
+    } else {
+        Vec::new()
+    };
+
+    if !is_room_strategy && (strategy_id >= 10 || (opt_seed > 0 && strategy_id >= 2)) {
         let mut rng_state = seed_base.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let n = ordered_parts.len();
         if n > 1 {
@@ -626,7 +644,8 @@ where
 
     // Helper closure to try placing a part onto a SINGLE sheet
     let try_place_on_single_sheet = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>], failed_hole_keys: &mut std::collections::HashSet<u64>| -> bool {
-        if (sheet_in_sheet || part.size_group.is_filler())
+        let min_dim = part.variants[0].bbox.width().min(part.variants[0].bbox.height());
+        if (sheet_in_sheet || part.size_group.is_filler() || min_dim <= 220.0)
             && sheets[sheet_idx].has_holes_or_pockets()
             && !failed_hole_keys.contains(&part.shape_key)
         {
@@ -728,9 +747,50 @@ where
         let mut failed_hole_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut failed_sheet_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut pass_count = 0;
+
+        if is_room_strategy {
+            let mut active_sheet_room = String::new();
+            for i in 0..total_parts {
+                if !placed_flags[i] && !part_rooms[i].is_empty() {
+                    active_sheet_room = part_rooms[i].clone();
+                    break;
+                }
+            }
+            if !active_sheet_room.is_empty() {
+                for i in 0..total_parts {
+                    if placed_flags[i] || part_rooms[i] != active_sheet_room { continue; }
+                    let part = &ordered_parts[i];
+                    if failed_sheet_keys.contains(&part.shape_key) { continue; }
+                    if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys) {
+                        placed_flags[i] = true;
+                        placed_any_on_this_sheet = true;
+                        if !part.variants[0].norm_holes.is_empty() {
+                            failed_sheet_keys.clear();
+                            failed_hole_keys.clear();
+                            for j in 0..total_parts {
+                                if placed_flags[j] || part_rooms[j] != active_sheet_room { continue; }
+                                let cand = &ordered_parts[j];
+                                if !cand.variants[0].norm_holes.is_empty() || failed_hole_keys.contains(&cand.shape_key) { continue; }
+                                if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements) {
+                                    placed_flags[j] = true;
+                                } else {
+                                    failed_hole_keys.insert(cand.shape_key);
+                                }
+                            }
+                        }
+                    } else {
+                        failed_sheet_keys.insert(part.shape_key);
+                    }
+                }
+                failed_sheet_keys.clear();
+                failed_hole_keys.clear();
+            }
+        }
+
         loop {
             pass_count += 1;
             let mut placed_in_this_pass = false;
+            let mut holes_added_in_pass = false;
 
             if sheets[current_sheet_idx].has_holes_or_pockets() {
                 for i in 0..total_parts {
@@ -743,6 +803,7 @@ where
                         placed_any_on_this_sheet = true;
                         if !part.variants[0].norm_holes.is_empty() {
                             failed_hole_keys.clear();
+                            holes_added_in_pass = true;
                         }
                     } else {
                         failed_hole_keys.insert(part.shape_key);
@@ -761,13 +822,24 @@ where
                     if !part.variants[0].norm_holes.is_empty() {
                         failed_sheet_keys.clear();
                         failed_hole_keys.clear();
+                        holes_added_in_pass = true;
+                        for j in 0..total_parts {
+                            if placed_flags[j] { continue; }
+                            let cand = &ordered_parts[j];
+                            if !cand.variants[0].norm_holes.is_empty() || failed_hole_keys.contains(&cand.shape_key) { continue; }
+                            if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements) {
+                                placed_flags[j] = true;
+                            } else {
+                                failed_hole_keys.insert(cand.shape_key);
+                            }
+                        }
                     }
                 } else {
                     failed_sheet_keys.insert(part.shape_key);
                 }
             }
 
-            if !placed_in_this_pass || pass_count >= 2 {
+            if !placed_in_this_pass || !holes_added_in_pass || pass_count >= 2 {
                 break;
             }
         }

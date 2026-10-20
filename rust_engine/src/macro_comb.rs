@@ -385,6 +385,279 @@ pub fn find_best_mating(
     })
 }
 
+pub fn extract_macro_cavity_holes(
+    children: &[ClusterChild],
+    macro_w: f64,
+    macro_h: f64,
+) -> Option<Vec<Vec<[f64; 2]>>> {
+    if children.is_empty() || macro_w <= 60.0 || macro_h <= 60.0 {
+        return None;
+    }
+    let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
+    let mut child_polys: Vec<Polygon> = Vec::with_capacity(children.len());
+    for child in children {
+        let raw = match child.contour.as_ref() {
+            Some(c) if c.len() >= 3 => c,
+            _ => continue,
+        };
+        let ox = child.offset_x.unwrap_or(0.0);
+        let oy = child.offset_y.unwrap_or(0.0);
+        let rot = if child.manual_cluster_child == Some(true) {
+            0.0
+        } else {
+            child.rotation_degrees.unwrap_or(0.0)
+        };
+        let base_poly = Polygon::from_raw(raw);
+        let cand = base_poly.rotate_degrees(rot, Point::new(0.0, 0.0)).translate(ox, oy);
+        let cb = cand.bounding_box();
+        let poly = if cb.min_x >= -5.0 && cb.min_y >= -5.0 && cb.max_x <= macro_w + 5.0 && cb.max_y <= macro_h + 5.0 {
+            cand
+        } else {
+            let (norm_p, _, _) = base_poly.rotate_degrees(rot, Point::new(0.0, 0.0)).normalize_to_origin();
+            norm_p.translate(ox, oy)
+        };
+        let decimated = if poly.points.len() > 64 {
+            decimate_curved_polygon(&poly.points, 6.0)
+        } else {
+            poly
+        };
+        child_polys.push(decimated);
+    }
+    if child_polys.is_empty() {
+        return None;
+    }
+
+    let is_rect_free = |rx1: f64, ry1: f64, rx2: f64, ry2: f64| -> bool {
+        if rx1 < -1e-4 || ry1 < -1e-4 || rx2 > macro_w + 1e-4 || ry2 > macro_h + 1e-4 {
+            return false;
+        }
+        if rx2 - rx1 < 20.0 || ry2 - ry1 < 20.0 {
+            return false;
+        }
+        let eps = 0.15;
+        let rect_poly = Polygon::new(vec![
+            Point::new(rx1 + eps, ry1 + eps),
+            Point::new(rx2 - eps, ry1 + eps),
+            Point::new(rx2 - eps, ry2 - eps),
+            Point::new(rx1 + eps, ry2 - eps),
+        ]);
+        for cp in &child_polys {
+            if polygons_collide_concave_safe(&rect_poly, cp, 0.0) {
+                return false;
+            }
+        }
+        true
+    };
+
+    let nx = 28usize;
+    let ny = 28usize;
+    let dx = macro_w / (nx as f64);
+    let dy = macro_h / (ny as f64);
+    let mut free_grid = vec![vec![false; nx]; ny];
+    for iy in 0..ny {
+        let cy0 = (iy as f64) * dy;
+        for ix in 0..nx {
+            let cx0 = (ix as f64) * dx;
+            let sample_pts = [
+                Point::new(cx0 + dx * 0.5, cy0 + dy * 0.5),
+                Point::new(cx0 + dx * 0.2, cy0 + dy * 0.2),
+                Point::new(cx0 + dx * 0.8, cy0 + dy * 0.2),
+                Point::new(cx0 + dx * 0.8, cy0 + dy * 0.8),
+                Point::new(cx0 + dx * 0.2, cy0 + dy * 0.8),
+            ];
+            free_grid[iy][ix] = sample_pts.iter().all(|pt| {
+                child_polys.iter().all(|cp| !cp.contains_point_strict(*pt, 0.0))
+            });
+        }
+    }
+
+    let mut heights = vec![0usize; nx];
+    let mut raw_candidates: Vec<(f64, f64, f64, f64, f64)> = Vec::new();
+    for iy in 0..ny {
+        for ix in 0..nx {
+            heights[ix] = if free_grid[iy][ix] { heights[ix] + 1 } else { 0 };
+        }
+        for ix1 in 0..nx {
+            if heights[ix1] == 0 {
+                continue;
+            }
+            let mut min_h = heights[ix1];
+            for ix2 in ix1..nx {
+                if heights[ix2] == 0 {
+                    break;
+                }
+                if heights[ix2] < min_h {
+                    min_h = heights[ix2];
+                }
+                let rw = ((ix2 - ix1 + 1) as f64) * dx;
+                let rh = (min_h as f64) * dy;
+                let area = rw * rh;
+                if rw.min(rh) >= 32.0 && rw.max(rh) >= 80.0 && area >= 5000.0 {
+                    let rx1 = (ix1 as f64) * dx;
+                    let ry1 = ((iy + 1 - min_h) as f64) * dy;
+                    let rx2 = ((ix2 + 1) as f64) * dx;
+                    let ry2 = ((iy + 1) as f64) * dy;
+                    raw_candidates.push((area, rx1, ry1, rx2, ry2));
+                }
+            }
+        }
+    }
+    raw_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let expand_rect = |mut x1: f64, mut y1: f64, mut x2: f64, mut y2: f64, x_first: bool| -> (f64, f64, f64, f64) {
+        for &step in &[8.0, 4.0, 2.0, 1.0, 0.5, 0.25] {
+            if x_first {
+                while x1 - step >= 0.0 && is_rect_free(x1 - step, y1, x2, y2) { x1 -= step; }
+                while x2 + step <= macro_w && is_rect_free(x1, y1, x2 + step, y2) { x2 += step; }
+                while y1 - step >= 0.0 && is_rect_free(x1, y1 - step, x2, y2) { y1 -= step; }
+                while y2 + step <= macro_h && is_rect_free(x1, y1, x2, y2 + step) { y2 += step; }
+            } else {
+                while y1 - step >= 0.0 && is_rect_free(x1, y1 - step, x2, y2) { y1 -= step; }
+                while y2 + step <= macro_h && is_rect_free(x1, y1, x2, y2 + step) { y2 += step; }
+                while x1 - step >= 0.0 && is_rect_free(x1 - step, y1, x2, y2) { x1 -= step; }
+                while x2 + step <= macro_w && is_rect_free(x1, y1, x2 + step, y2) { x2 += step; }
+            }
+        }
+        (x1, y1, x2, y2)
+    };
+
+    let mut refined: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for &(_, mut x1, mut y1, mut x2, mut y2) in raw_candidates.iter().take(24) {
+        if !refined.iter().all(|&(ex1, ey1, ex2, ey2)| {
+            let iw = (x2.min(ex2) - x1.max(ex1)).max(0.0);
+            let ih = (y2.min(ey2) - y1.max(ey1)).max(0.0);
+            iw * ih < (x2 - x1) * (y2 - y1) * 0.65
+        }) {
+            continue;
+        }
+        let mut valid = is_rect_free(x1, y1, x2, y2);
+        for _ in 0..4 {
+            if valid { break; }
+            x1 += 2.0; y1 += 2.0; x2 -= 2.0; y2 -= 2.0;
+            valid = is_rect_free(x1, y1, x2, y2);
+        }
+        if !valid {
+            continue;
+        }
+        let (ax1, ay1, ax2, ay2) = expand_rect(x1, y1, x2, y2, true);
+        let (bx1, by1, bx2, by2) = expand_rect(x1, y1, x2, y2, false);
+        let (fx1, fy1, fx2, fy2) = if (ax2 - ax1) * (ay2 - ay1) >= (bx2 - bx1) * (by2 - by1) {
+            (ax1, ay1, ax2, ay2)
+        } else {
+            (bx1, by1, bx2, by2)
+        };
+        let fw = fx2 - fx1;
+        let fh = fy2 - fy1;
+        if fw.min(fh) >= 40.0 && fw.max(fh) >= 100.0 && fw * fh >= 8000.0 {
+            refined.push((fx1, fy1, fx2, fy2));
+        }
+    }
+
+    refined.sort_by(|a, b| {
+        let area_a = (a.2 - a.0) * (a.3 - a.1);
+        let area_b = (b.2 - b.0) * (b.3 - b.1);
+        area_b.partial_cmp(&area_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut primary_pockets: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for (x1, y1, x2, y2) in refined {
+        let area = (x2 - x1) * (y2 - y1);
+        let overlaps = primary_pockets.iter().any(|&(ex1, ey1, ex2, ey2)| {
+            let iw = (x2.min(ex2) - x1.max(ex1)).max(0.0);
+            let ih = (y2.min(ey2) - y1.max(ey1)).max(0.0);
+            iw * ih > area * 0.35
+        });
+        if !overlaps {
+            primary_pockets.push((x1, y1, x2, y2));
+        }
+    }
+
+    let is_deep_inner_safe = |dx1: f64, dy1: f64, dx2: f64, dy2: f64, open_t: bool, open_b: bool, open_l: bool, open_r: bool| -> bool {
+        let c = 7.0;
+        let ix1 = if open_l { dx1 + 0.2 } else { dx1 + c };
+        let ix2 = if open_r { dx2 - 0.2 } else { dx2 - c };
+        let iy1 = if open_b { dy1 + 0.2 } else { dy1 + c };
+        let iy2 = if open_t { dy2 - 0.2 } else { dy2 - c };
+        if ix2 - ix1 < 20.0 || iy2 - iy1 < 20.0 {
+            return false;
+        }
+        let inner_poly = Polygon::new(vec![
+            Point::new(ix1, iy1),
+            Point::new(ix2, iy1),
+            Point::new(ix2, iy2),
+            Point::new(ix1, iy2),
+        ]);
+        child_polys.iter().all(|cp| !polygons_collide_concave_safe(&inner_poly, cp, c))
+    };
+
+    let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
+    for &(x1, y1, x2, y2) in &primary_pockets {
+        let rx1 = if x1 <= 1.5 { 0.0 } else { round3(x1) };
+        let ry1 = if y1 <= 1.5 { 0.0 } else { round3(y1) };
+        let rx2 = if (macro_w - x2) <= 1.5 { round3(macro_w) } else { round3(x2) };
+        let ry2 = if (macro_h - y2) <= 1.5 { round3(macro_h) } else { round3(y2) };
+        holes.push(vec![[rx1, ry1], [rx2, ry1], [rx2, ry2], [rx1, ry2]]);
+
+        let open_t = ry2 >= macro_h - 1.5;
+        let open_b = ry1 <= 1.5;
+        let open_l = rx1 <= 1.5;
+        let open_r = rx2 >= macro_w - 1.5;
+        if (open_t || open_b) && (rx2 - rx1) >= 124.0 {
+            let inset_x = (((rx2 - rx1) - 121.5) * 0.5).clamp(4.0, 9.0);
+            let dx1 = round3(rx1 + inset_x);
+            let dx2 = round3(rx2 - inset_x);
+            let mut dy1 = ry1;
+            let mut dy2 = ry2;
+            for &step in &[16.0, 8.0, 4.0, 2.0, 1.0, 0.5] {
+                if open_t {
+                    while dy1 - step >= 0.0 && is_deep_inner_safe(dx1, dy1 - step, dx2, dy2, open_t, open_b, false, false) {
+                        dy1 -= step;
+                    }
+                }
+                if open_b {
+                    while dy2 + step <= macro_h && is_deep_inner_safe(dx1, dy1, dx2, dy2 + step, open_t, open_b, false, false) {
+                        dy2 += step;
+                    }
+                }
+            }
+            if (ry1 - dy1) >= 4.0 || (dy2 - ry2) >= 4.0 {
+                let rdy1 = round3(dy1);
+                let rdy2 = round3(dy2);
+                holes.push(vec![[dx1, rdy1], [dx2, rdy1], [dx2, rdy2], [dx1, rdy2]]);
+            }
+        } else if (open_l || open_r) && (ry2 - ry1) >= 124.0 {
+            let inset_y = (((ry2 - ry1) - 121.5) * 0.5).clamp(4.0, 9.0);
+            let dy1 = round3(ry1 + inset_y);
+            let dy2 = round3(ry2 - inset_y);
+            let mut dx1 = rx1;
+            let mut dx2 = rx2;
+            for &step in &[16.0, 8.0, 4.0, 2.0, 1.0, 0.5] {
+                if open_r {
+                    while dx1 - step >= 0.0 && is_deep_inner_safe(dx1 - step, dy1, dx2, dy2, false, false, open_l, open_r) {
+                        dx1 -= step;
+                    }
+                }
+                if open_l {
+                    while dx2 + step <= macro_w && is_deep_inner_safe(dx1, dy1, dx2 + step, dy2, false, false, open_l, open_r) {
+                        dx2 += step;
+                    }
+                }
+            }
+            if (rx1 - dx1) >= 4.0 || (dx2 - rx2) >= 4.0 {
+                let rdx1 = round3(dx1);
+                let rdx2 = round3(dx2);
+                holes.push(vec![[rdx1, dy1], [rdx2, dy1], [rdx2, dy2], [rdx1, dy2]]);
+            }
+        }
+    }
+
+    if holes.is_empty() {
+        None
+    } else {
+        Some(holes)
+    }
+}
+
 pub fn try_build_comb_pair(
     part_a: &PartInput,
     part_b: &PartInput,
@@ -417,6 +690,9 @@ pub fn try_build_comb_pair(
         (crate::packing::norm_angle(base_a - child_rot_a), if is_grain_locked { Some(90.0) } else { None })
     };
 
+    let children = vec![mating.child_a, mating.child_b];
+    let macro_holes = extract_macro_cavity_holes(&children, mating.macro_w, mating.macro_h);
+
     let macro_part = PartInput {
         entity_id: Some(format!("comb-macro:{}_{}", id_a, id_b)),
         id: Some(format!("{}+{}", id_a, id_b)),
@@ -430,7 +706,7 @@ pub fn try_build_comb_pair(
             [mating.macro_w, mating.macro_h],
             [0.0, mating.macro_h],
         ],
-        holes: None,
+        holes: macro_holes,
         render_contour: None,
         render_holes: None,
         collision_contour: None,
@@ -456,7 +732,7 @@ pub fn try_build_comb_pair(
         color: part_a.color.clone(),
         logical_part_count: Some(2),
         manual_cluster_macro: Some(true),
-        manual_cluster_children: Some(vec![mating.child_a, mating.child_b]),
+        manual_cluster_children: Some(children),
         two_sided: Some(part_a.two_sided == Some(true) || part_b.two_sided == Some(true)),
         has_circular_arc: Some(false),
     };
@@ -576,6 +852,9 @@ pub fn create_macro_part(
         (crate::packing::norm_angle(base_a - child_rot_a), if is_grain_locked { Some(90.0) } else { None })
     };
 
+    let children = vec![child_a, child_b];
+    let macro_holes = extract_macro_cavity_holes(&children, offsets.macro_w, offsets.macro_h);
+
     PartInput {
         entity_id: Some(format!("comb-macro:{}_{}", id_a, id_b)),
         id: Some(format!("{}+{}", id_a, id_b)),
@@ -589,7 +868,7 @@ pub fn create_macro_part(
             [offsets.macro_w, offsets.macro_h],
             [0.0, offsets.macro_h],
         ],
-        holes: None,
+        holes: macro_holes,
         render_contour: None,
         render_holes: None,
         collision_contour: None,
@@ -615,7 +894,7 @@ pub fn create_macro_part(
         color: part_a.color.clone(),
         logical_part_count: Some(2),
         manual_cluster_macro: Some(true),
-        manual_cluster_children: Some(vec![child_a, child_b]),
+        manual_cluster_children: Some(children),
         two_sided: Some(part_a.two_sided == Some(true) || part_b.two_sided == Some(true)),
         has_circular_arc: Some(false),
     }
@@ -671,6 +950,15 @@ pub fn polygons_collide_concave_safe(poly1: &Polygon, poly2: &Polygon, spacing: 
                 return true;
             }
         }
+    }
+    if spacing > 1e-4 {
+        if bbox2.contains_rect(&bbox1, 1e-4) && poly2.contains_point_strict(poly1.points[0], 0.0) {
+            return true;
+        }
+        if bbox1.contains_rect(&bbox2, 1e-4) && poly1.contains_point_strict(poly2.points[0], 0.0) {
+            return true;
+        }
+        return false;
     }
     for pt in &poly1.points {
         if pt.x > bbox2.min_x && pt.x < bbox2.max_x && pt.y > bbox2.min_y && pt.y < bbox2.max_y && poly2.contains_point_strict(*pt, 0.0) {
@@ -1149,6 +1437,7 @@ pub fn create_parallel_nested_stack_macro(
         macro_w,
         macro_h,
     );
+    let macro_holes = extract_macro_cavity_holes(&children, macro_w, macro_h);
 
     PartInput {
         entity_id: Some(macro_eid),
@@ -1158,7 +1447,7 @@ pub fn create_parallel_nested_stack_macro(
         height: Some(macro_h),
         area: Some(round3(total_area)),
         contour: profile_contour,
-        holes: None,
+        holes: macro_holes,
         render_contour: None,
         render_holes: None,
         collision_contour: None,
@@ -1287,8 +1576,8 @@ pub fn pair_comb_parts(
         return (parts.to_vec(), 0);
     }
 
-    use std::collections::HashMap;
-    let mut groups_by_sig: HashMap<String, Vec<usize>> = HashMap::new();
+    use std::collections::{BTreeMap, HashMap};
+    let mut groups_by_sig: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for &idx in &candidate_indices {
         let sig = &signatures[idx];
         groups_by_sig.entry(sig.clone()).or_default().push(idx);
@@ -1339,15 +1628,19 @@ pub fn pair_comb_parts(
     // Phase 1: Self-mating within identical shape families O(N)
     for (_sig, indices) in groups_by_sig.iter_mut() {
         if indices.len() >= 2 {
-            // Group two-sided parts together first so they pair cleanly with each other
-            indices.sort_by_key(|&idx| parts[idx].two_sided != Some(true));
+            // Group two-sided parts and same-room parts together first so they pair cleanly with each other
+            indices.sort_by(|&a, &b| {
+                (parts[a].two_sided != Some(true))
+                    .cmp(&(parts[b].two_sided != Some(true)))
+                    .then_with(|| crate::types::get_part_room_key(&parts[a]).cmp(&crate::types::get_part_room_key(&parts[b])))
+            });
 
             let first_idx = indices[0];
             let poly_first = Polygon::from_raw(&parts[first_idx].contour);
             let parallel_nest = find_parallel_nesting_vector(&poly_first, spacing, max_bw, max_bh);
 
             if let Some((dx, dy, _ratio)) = parallel_nest {
-                let mut grain_groups: HashMap<(i64, bool), Vec<usize>> = HashMap::new();
+                let mut grain_groups: BTreeMap<(i64, bool), Vec<usize>> = BTreeMap::new();
                 for &idx in indices.iter() {
                     let r = parts[idx].base_rotation_degrees.or(parts[idx].rotation_degrees).unwrap_or(0.0).round() as i64 % 360;
                     let ts = parts[idx].two_sided == Some(true);
@@ -1445,7 +1738,51 @@ pub fn pair_comb_parts(
         }
     }
 
-    // Phase 2: Cross-family mating disabled. Only identical curved shapes are paired.
+    // Phase 2: Bounded complementary mating for remaining unpaired irregular parts (e.g. 180-deg rotated siblings or complementary wedges)
+    let mut unpaired_cands: Vec<usize> = candidate_indices.iter().copied().filter(|&idx| !used[idx]).collect();
+    if unpaired_cands.len() >= 2 {
+        unpaired_cands.sort_by(|&a, &b| {
+            (parts[a].two_sided != Some(true))
+                .cmp(&(parts[b].two_sided != Some(true)))
+                .then_with(|| crate::types::get_part_room_key(&parts[a]).cmp(&crate::types::get_part_room_key(&parts[b])))
+                .then_with(|| {
+                    let aa = parts[a].area.unwrap_or(0.0);
+                    let ab = parts[b].area.unwrap_or(0.0);
+                    ab.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        unpaired_cands.truncate(20);
+        for ia in 0..unpaired_cands.len() {
+            let idx_a = unpaired_cands[ia];
+            if used[idx_a] {
+                continue;
+            }
+            let p_a = Polygon::from_raw(&parts[idx_a].contour);
+            let box_a = p_a.bounding_box().area();
+            for ib in (ia + 1)..unpaired_cands.len() {
+                let idx_b = unpaired_cands[ib];
+                if used[idx_b] || parts[idx_a].two_sided != parts[idx_b].two_sided {
+                    continue;
+                }
+                if let Some(offsets) = get_mating(idx_a, idx_b, &mut mating_cache) {
+                    if !is_pair_grain_compatible(idx_a, idx_b, &offsets) {
+                        continue;
+                    }
+                    let p_b = Polygon::from_raw(&parts[idx_b].contour);
+                    let orig_boxes_area = box_a + p_b.bounding_box().area();
+                    let macro_box = offsets.macro_w * offsets.macro_h;
+                    if orig_boxes_area > 1.0 && macro_box <= orig_boxes_area * 0.82 && offsets.fill_rate >= 0.70 {
+                        let macro_p = create_macro_part(&parts[idx_a], &parts[idx_b], &offsets, Some(config));
+                        macro_parts.push(macro_p);
+                        used[idx_a] = true;
+                        used[idx_b] = true;
+                        comb_count += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // Step 4: Assemble final parts list
     let mut result = Vec::with_capacity(parts.len());

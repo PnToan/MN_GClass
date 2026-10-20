@@ -75,6 +75,7 @@ fn main() {
 
     let raw_content = std::fs::read_to_string(&job_path).expect("Cannot read job file");
     let content = raw_content.trim_start_matches('\u{feff}');
+    types::clear_room_registry();
     let job_input: JobInput = serde_json::from_str(content).expect("Cannot parse job JSON");
 
     let start_time = Instant::now();
@@ -112,54 +113,67 @@ fn main() {
         let p_path_clone = progress_path.clone();
         let prev_path_clone = preview_path.clone();
         let prev_layouts_base = current_layouts.clone();
+        let mut last_prev_ms: u128 = 0;
+        let mut last_prog_ms: u128 = 0;
 
         let final_mat_layout = epochs::optimize_material_layout(material_state, |phase, local_pct, iter, total, layout_variant| {
             let base_pct = ((mat_idx as f64) / (total_materials as f64)) * 80.0 + 15.0;
             let mat_slice = 80.0 / (total_materials as f64);
             let pct = (base_pct + (local_pct / 100.0) * mat_slice).clamp(15.0, 95.0);
+            let now_ms = start_time.elapsed().as_millis();
+            let is_milestone = total > 0 || iter <= 1;
 
             if let Some(ref prev_path) = prev_path_clone {
-                let mut prev_layouts = prev_layouts_base.clone();
-                prev_layouts.push(layout_variant.clone());
-                write_json_atomic(
-                    prev_path,
-                    &PreviewOutput {
-                        ok: true,
-                        partial: true,
-                        layouts: prev_layouts,
-                    },
-                );
+                let total_sheets_now = prev_layouts_base.iter().map(|l| l.sheets.len()).sum::<usize>() + layout_variant.sheets.len();
+                let total_parts_now = prev_layouts_base.iter().flat_map(|l| &l.sheets).map(|s| s.placements.len()).sum::<usize>()
+                    + layout_variant.sheets.iter().map(|s| s.placements.len()).sum::<usize>();
+                if total_sheets_now <= 20 && total_parts_now <= 350 && (is_milestone || last_prev_ms == 0 || now_ms.saturating_sub(last_prev_ms) >= 450) {
+                    last_prev_ms = now_ms;
+                    let mut prev_layouts = prev_layouts_base.clone();
+                    prev_layouts.push(layout_variant.clone());
+                    write_json_atomic(
+                        prev_path,
+                        &PreviewOutput {
+                            ok: true,
+                            partial: true,
+                            layouts: prev_layouts,
+                        },
+                    );
+                }
             }
 
             if let Some(ref p_path) = p_path_clone {
-                let cur_elapsed = start_time.elapsed().as_secs_f64();
-                let time_str = if cur_elapsed >= 60.0 {
-                    let m = (cur_elapsed / 60.0).floor() as u64;
-                    let rem = cur_elapsed % 60.0;
-                    format!("{}p {:.1}s", m, rem)
-                } else {
-                    format!("{:.2}s", cur_elapsed)
-                };
-                let iter_str = if total > 0 {
-                    format!("chiến lược {}/{}", iter, total)
-                } else {
-                    format!("tấm {}", iter)
-                };
-                write_json_atomic(
-                    p_path,
-                    &ProgressOutput {
-                        running: true,
-                        overall_percent: pct,
-                        optimization_iteration: iter,
-                        optimization_total: total,
-                        message: format!(
-                            "Đang {} ({}, {})...",
-                            phase,
-                            iter_str,
-                            time_str
-                        ),
-                    },
-                );
+                if is_milestone || last_prog_ms == 0 || now_ms.saturating_sub(last_prog_ms) >= 180 {
+                    last_prog_ms = now_ms;
+                    let cur_elapsed = start_time.elapsed().as_secs_f64();
+                    let time_str = if cur_elapsed >= 60.0 {
+                        let m = (cur_elapsed / 60.0).floor() as u64;
+                        let rem = cur_elapsed % 60.0;
+                        format!("{}p {:.1}s", m, rem)
+                    } else {
+                        format!("{:.2}s", cur_elapsed)
+                    };
+                    let iter_str = if total > 0 {
+                        format!("chiến lược {}/{}", iter, total)
+                    } else {
+                        format!("tấm {}", iter)
+                    };
+                    write_json_atomic(
+                        p_path,
+                        &ProgressOutput {
+                            running: true,
+                            overall_percent: pct,
+                            optimization_iteration: iter,
+                            optimization_total: total,
+                            message: format!(
+                                "Đang {} ({}, {})...",
+                                phase,
+                                iter_str,
+                                time_str
+                            ),
+                        },
+                    );
+                }
             }
         });
 
