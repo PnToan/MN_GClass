@@ -93,11 +93,15 @@ pub fn prepare_parts(
         let area = p.area.unwrap_or_else(|| poly.area());
         let source_width = p.width.filter(|v| *v > 1e-6).unwrap_or_else(|| orig_bbox.width());
         let source_height = p.height.filter(|v| *v > 1e-6).unwrap_or_else(|| orig_bbox.height());
-        let small_part = small_part_threshold > 0.001
+        let is_macro = p.manual_cluster_macro == Some(true);
+        let merge_cut = config.merge_cut_paths.unwrap_or(false);
+        let small_part = !is_macro
+            && small_part_threshold > 0.001
             && source_width > 0.001
             && source_height > 0.001
-            && source_width.min(source_height) <= small_part_threshold + 0.001;
-        let small_part_clearance = if small_part {
+            && source_width.min(source_height) <= small_part_threshold + 0.001
+            && (merge_cut || source_width.max(source_height) < 100.0 || area < 4500.0);
+        let small_part_clearance = if small_part && configured_small_part_clearance > 0.001 {
             spacing.max(configured_small_part_clearance)
         } else {
             0.0
@@ -232,8 +236,13 @@ pub fn prepare_parts(
         let cached_geoms = if let Some(cg) = geom_cache.get(&raw_key) {
             cg.clone()
         } else {
+            let base_poly = if p.manual_cluster_macro != Some(true) && poly.points.len() > 48 {
+                crate::macro_comb::decimate_curved_polygon(&poly.points, 10.0)
+            } else {
+                poly.clone()
+            };
             let mut geoms: Vec<(f64, f64, f64, Polygon, Vec<Polygon>, Polygon, Rect, Rect, bool)> = allowed_rotations.iter().map(|&rot| {
-                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                let rotated = base_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
                 let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
                 let bbox = norm_poly.bounding_box();
                 let norm_holes: Vec<Polygon> = effective_holes.as_ref().map_or(Vec::new(), |holes_vec| {
@@ -540,16 +549,37 @@ where
         Vec::new()
     };
 
-    if !is_room_strategy && (strategy_id >= 10 || (opt_seed > 0 && strategy_id >= 2)) {
+    if !is_room_strategy && ordered_parts.len() >= 120 {
+        let filler_start = ordered_parts.partition_point(|p| !p.size_group.is_filler());
+        let filler_len = ordered_parts.len().saturating_sub(filler_start);
+        if filler_len >= 80 {
+            ordered_parts[filler_start..].sort_by(|a, b| {
+                if (a.area - b.area).abs() > 50.0 {
+                    b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    a.variants[0].bbox.height().partial_cmp(&b.variants[0].bbox.height()).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            });
+        }
+    }
+
+    let min_filler_area = ordered_parts.last().map_or(0.0, |p| p.area);
+    let min_filler_h = ordered_parts.last().map_or(0.0, |p| p.variants[0].bbox.height());
+
+    if !is_room_strategy && (strategy_id >= 10 || (opt_seed > 0 && strategy_id >= 6)) {
         let mut rng_state = seed_base.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let n = ordered_parts.len();
         if n > 1 {
             for i in (1..n).rev() {
                 if ordered_parts[i].is_two_sided { continue; }
                 let i_filler = ordered_parts[i].size_group.is_filler();
+                let i_area = ordered_parts[i].area;
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let j = ((rng_state >> 32) as usize) % (i + 1);
-                if !ordered_parts[j].is_two_sided && ordered_parts[j].size_group.is_filler() == i_filler {
+                if !ordered_parts[j].is_two_sided
+                    && ordered_parts[j].size_group.is_filler() == i_filler
+                    && (ordered_parts[j].area - i_area).abs() <= i_area * 0.25
+                {
                     ordered_parts.swap(i, j);
                 }
             }
@@ -565,7 +595,14 @@ where
     let board_area = board_width * board_height;
 
     // Helper closure to try placing a part specifically into hole or concave pocket cavities on a SINGLE sheet
-    let try_place_in_single_sheet_holes = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>]| -> bool {
+    let try_place_in_single_sheet_holes = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>], reserve_for_smaller: bool| -> bool {
+        if reserve_for_smaller
+            && min_filler_area > 0.0
+            && part.area > min_filler_area * 1.35
+            && sheet_placements[sheet_idx].iter().any(|p| p.manual_cluster_macro == Some(true))
+        {
+            return false;
+        }
         let sheet = &mut sheets[sheet_idx];
         let allow_pockets = sheet_in_sheet || part.size_group.is_filler();
         if !sheet.has_holes_or_pockets() {
@@ -595,7 +632,7 @@ where
         }
 
         if let (Some((px, py)), Some(variant)) = (best_pt, best_variant) {
-            let col_poly = if variant.norm_poly.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&variant.norm_poly.points, 16.0) } else { variant.norm_poly.clone() };
+            let col_poly = if part.original.manual_cluster_macro != Some(true) && variant.norm_poly.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&variant.norm_poly.points, 16.0) } else { variant.norm_poly.clone() };
             let col_holes = variant.norm_holes.iter().map(|h| if h.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&h.points, 16.0) } else { h.clone() }).collect();
             sheet.add_placed(col_poly, col_holes, px, py, variant.rotation, part.small_part, part.small_part_clearance);
 
@@ -643,13 +680,17 @@ where
     };
 
     // Helper closure to try placing a part onto a SINGLE sheet
-    let try_place_on_single_sheet = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>], failed_hole_keys: &mut std::collections::HashSet<u64>| -> bool {
+    let try_place_on_single_sheet = |part: &ProcessedPart, sheet_idx: usize, sheets: &mut [SheetContext], sheet_placements: &mut [Vec<PlacementOutput>], failed_hole_keys: &mut std::collections::HashSet<u64>, reserve_for_smaller: bool| -> bool {
         let min_dim = part.variants[0].bbox.width().min(part.variants[0].bbox.height());
-        if (sheet_in_sheet || part.size_group.is_filler() || min_dim <= 220.0)
+        let max_dim = part.variants[0].bbox.width().max(part.variants[0].bbox.height());
+        let has_macro_on_sheet = sheet_placements[sheet_idx].iter().any(|p| p.manual_cluster_macro == Some(true));
+        let is_larger_filler = reserve_for_smaller && min_filler_area > 0.0 && part.area > min_filler_area * 1.35 && part.size_group.is_filler();
+        if (sheet_in_sheet || part.size_group.is_filler() || (min_dim <= 220.0 && max_dim <= 600.0))
+            && !(has_macro_on_sheet && is_larger_filler)
             && sheets[sheet_idx].has_holes_or_pockets()
             && !failed_hole_keys.contains(&part.shape_key)
         {
-            if try_place_in_single_sheet_holes(part, sheet_idx, sheets, sheet_placements) {
+            if try_place_in_single_sheet_holes(part, sheet_idx, sheets, sheet_placements, reserve_for_smaller) {
                 if !part.variants[0].norm_holes.is_empty() {
                     failed_hole_keys.clear();
                 }
@@ -674,6 +715,17 @@ where
                 part.small_part_clearance,
                 bl_weight,
             ) {
+                if has_macro_on_sheet && is_larger_filler && min_filler_h > 0.0 {
+                    let vh = variant.bbox.height();
+                    let rem_h = (board_height - edge_margin) - py;
+                    if vh > min_filler_h + 8.0
+                        && rem_h < vh * 2.0 + part_spacing
+                        && rem_h - vh - part_spacing < min_filler_h
+                        && rem_h >= min_filler_h * 2.0 + part_spacing
+                    {
+                        continue;
+                    }
+                }
                 if score < best_score {
                     best_score = score;
                     best_pt = Some((px, py));
@@ -683,7 +735,7 @@ where
         }
 
         if let (Some((px, py)), Some(variant)) = (best_pt, best_variant) {
-            let col_poly = if variant.norm_poly.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&variant.norm_poly.points, 16.0) } else { variant.norm_poly.clone() };
+            let col_poly = if part.original.manual_cluster_macro != Some(true) && variant.norm_poly.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&variant.norm_poly.points, 16.0) } else { variant.norm_poly.clone() };
             let col_holes = variant.norm_holes.iter().map(|h| if h.points.len() > 64 { crate::macro_comb::decimate_curved_polygon(&h.points, 16.0) } else { h.clone() }).collect();
             sheet.add_placed(col_poly, col_holes, px, py, variant.rotation, part.small_part, part.small_part_clearance);
 
@@ -761,7 +813,7 @@ where
                     if placed_flags[i] || part_rooms[i] != active_sheet_room { continue; }
                     let part = &ordered_parts[i];
                     if failed_sheet_keys.contains(&part.shape_key) { continue; }
-                    if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys) {
+                    if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys, false) {
                         placed_flags[i] = true;
                         placed_any_on_this_sheet = true;
                         if !part.variants[0].norm_holes.is_empty() {
@@ -771,7 +823,7 @@ where
                                 if placed_flags[j] || part_rooms[j] != active_sheet_room { continue; }
                                 let cand = &ordered_parts[j];
                                 if !cand.variants[0].norm_holes.is_empty() || failed_hole_keys.contains(&cand.shape_key) { continue; }
-                                if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements) {
+                                if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements, false) {
                                     placed_flags[j] = true;
                                 } else {
                                     failed_hole_keys.insert(cand.shape_key);
@@ -797,7 +849,8 @@ where
                     if placed_flags[i] { continue; }
                     let part = &ordered_parts[i];
                     if failed_hole_keys.contains(&part.shape_key) { continue; }
-                    if try_place_in_single_sheet_holes(part, current_sheet_idx, &mut sheets, &mut sheet_placements) {
+                    let reserve_for_smaller = total_parts >= 40 && !placed_flags[total_parts - 34];
+                    if try_place_in_single_sheet_holes(part, current_sheet_idx, &mut sheets, &mut sheet_placements, reserve_for_smaller) {
                         placed_flags[i] = true;
                         placed_in_this_pass = true;
                         placed_any_on_this_sheet = true;
@@ -815,7 +868,8 @@ where
                 if placed_flags[i] { continue; }
                 let part = &ordered_parts[i];
                 if failed_sheet_keys.contains(&part.shape_key) { continue; }
-                if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys) {
+                let reserve_for_smaller = total_parts >= 40 && !placed_flags[total_parts - 34];
+                if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys, reserve_for_smaller) {
                     placed_flags[i] = true;
                     placed_in_this_pass = true;
                     placed_any_on_this_sheet = true;
@@ -823,14 +877,17 @@ where
                         failed_sheet_keys.clear();
                         failed_hole_keys.clear();
                         holes_added_in_pass = true;
-                        for j in 0..total_parts {
-                            if placed_flags[j] { continue; }
-                            let cand = &ordered_parts[j];
-                            if !cand.variants[0].norm_holes.is_empty() || failed_hole_keys.contains(&cand.shape_key) { continue; }
-                            if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements) {
-                                placed_flags[j] = true;
-                            } else {
-                                failed_hole_keys.insert(cand.shape_key);
+                        if part.original.manual_cluster_macro != Some(true) {
+                            for j in 0..total_parts {
+                                if placed_flags[j] { continue; }
+                                let cand = &ordered_parts[j];
+                                if !cand.variants[0].norm_holes.is_empty() || failed_hole_keys.contains(&cand.shape_key) { continue; }
+                                let reserve_inner = total_parts >= 40 && !placed_flags[total_parts - 34];
+                                if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements, reserve_inner) {
+                                    placed_flags[j] = true;
+                                } else {
+                                    failed_hole_keys.insert(cand.shape_key);
+                                }
                             }
                         }
                     }

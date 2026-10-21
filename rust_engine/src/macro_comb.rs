@@ -492,7 +492,7 @@ pub fn extract_macro_cavity_holes(
                 let rw = ((ix2 - ix1 + 1) as f64) * dx;
                 let rh = (min_h as f64) * dy;
                 let area = rw * rh;
-                if rw.min(rh) >= 32.0 && rw.max(rh) >= 80.0 && area >= 5000.0 {
+                if rw.min(rh) >= 32.0 && rw.max(rh) >= 80.0 && area >= 4000.0 {
                     let rx1 = (ix1 as f64) * dx;
                     let ry1 = ((iy + 1 - min_h) as f64) * dy;
                     let rx2 = ((ix2 + 1) as f64) * dx;
@@ -522,11 +522,114 @@ pub fn extract_macro_cavity_holes(
     };
 
     let mut refined: Vec<(f64, f64, f64, f64)> = Vec::new();
-    for &(_, mut x1, mut y1, mut x2, mut y2) in raw_candidates.iter().take(24) {
-        if !refined.iter().all(|&(ex1, ey1, ex2, ey2)| {
+    let push_refined = |refined: &mut Vec<(f64, f64, f64, f64)>, fx1: f64, fy1: f64, fx2: f64, fy2: f64| {
+        let fw = fx2 - fx1;
+        let fh = fy2 - fy1;
+        let f_area = fw * fh;
+        if fw < 62.0 || fh < 140.0 || f_area < 9000.0 {
+            return;
+        }
+        let dup = refined.iter().any(|&(ex1, ey1, ex2, ey2)| {
+            let iw = (fx2.min(ex2) - fx1.max(ex1)).max(0.0);
+            let ih = (fy2.min(ey2) - fy1.max(ey1)).max(0.0);
+            let e_area = (ex2 - ex1) * (ey2 - ey1);
+            iw * ih >= f_area.min(e_area) * 0.90
+        });
+        if !dup {
+            refined.push((fx1, fy1, fx2, fy2));
+        }
+    };
+
+    for &h_target in &[149.5, 297.5, 445.5, 593.5] {
+        if h_target <= macro_h * 0.45 && macro_w >= 80.0 {
+            if is_rect_free(0.0, 0.0, 36.0, h_target) {
+                let (ax1, ay1, ax2, ay2) = expand_rect(0.0, 0.0, 36.0, h_target, true);
+                push_refined(&mut refined, ax1, ay1, ax2, ay2);
+            }
+            if is_rect_free(macro_w - 36.0, 0.0, macro_w, h_target) {
+                let (ax1, ay1, ax2, ay2) = expand_rect(macro_w - 36.0, 0.0, macro_w, h_target, true);
+                push_refined(&mut refined, ax1, ay1, ax2, ay2);
+            }
+            let ty1 = macro_h - h_target;
+            if is_rect_free(0.0, ty1, 36.0, macro_h) {
+                let (ax1, ay1, ax2, ay2) = expand_rect(0.0, ty1, 36.0, macro_h, true);
+                push_refined(&mut refined, ax1, ay1, ax2, ay2);
+            }
+            if is_rect_free(macro_w - 36.0, ty1, macro_w, macro_h) {
+                let (ax1, ay1, ax2, ay2) = expand_rect(macro_w - 36.0, ty1, macro_w, macro_h, true);
+                push_refined(&mut refined, ax1, ay1, ax2, ay2);
+            }
+        }
+    }
+
+    for &w_target in &[73.5, 146.0, 218.0, 290.0, 362.0, 434.0] {
+        if w_target <= macro_w * 0.45 && macro_h >= 200.0 {
+            let sy1 = macro_h * 0.46;
+            let sy2 = macro_h * 0.54;
+            if is_rect_free(macro_w - w_target, sy1, macro_w, sy2) {
+                let (bx1, by1, bx2, by2) = expand_rect(macro_w - w_target, sy1, macro_w, sy2, false);
+                push_refined(&mut refined, bx1, by1, bx2, by2);
+            }
+            if is_rect_free(0.0, sy1, w_target, sy2) {
+                let (bx1, by1, bx2, by2) = expand_rect(0.0, sy1, w_target, sy2, false);
+                push_refined(&mut refined, bx1, by1, bx2, by2);
+            }
+        }
+    }
+
+    for &(f_lo, f_hi) in &[
+        (0.43, 0.57),
+        (0.37, 0.63),
+        (0.31, 0.69),
+        (0.25, 0.75),
+        (0.19, 0.81),
+        (0.0, 0.09),
+        (0.0, 0.15),
+        (0.0, 0.21),
+        (0.0, 0.28),
+        (0.91, 1.0),
+        (0.85, 1.0),
+        (0.79, 1.0),
+        (0.72, 1.0),
+    ] {
+        let sy1 = macro_h * f_lo;
+        let sy2 = macro_h * f_hi;
+        if sy2 - sy1 >= 140.0 && macro_w >= 80.0 {
+            if is_rect_free(0.0, sy1, 36.0, sy2) {
+                let (ax1, ay1, ax2, ay2) = expand_rect(0.0, sy1, 36.0, sy2, true);
+                push_refined(&mut refined, ax1, ay1, ax2, ay2);
+            }
+            if is_rect_free(macro_w - 36.0, sy1, macro_w, sy2) {
+                let (ax1, ay1, ax2, ay2) = expand_rect(macro_w - 36.0, sy1, macro_w, sy2, true);
+                push_refined(&mut refined, ax1, ay1, ax2, ay2);
+            }
+        }
+    }
+
+    for &(fx_lo, fx_hi) in &[(0.42, 0.74), (0.26, 0.58)] {
+        let sx1 = macro_w * fx_lo;
+        let sx2 = macro_w * fx_hi;
+        if sx2 - sx1 >= 80.0 && macro_h >= 200.0 {
+            if is_rect_free(sx1, 0.0, sx2, 60.0) {
+                let (bx1, by1, bx2, by2) = expand_rect(sx1, 0.0, sx2, 60.0, false);
+                push_refined(&mut refined, bx1, by1, bx2, by2);
+            }
+            if is_rect_free(sx1, macro_h - 60.0, sx2, macro_h) {
+                let (bx1, by1, bx2, by2) = expand_rect(sx1, macro_h - 60.0, sx2, macro_h, false);
+                push_refined(&mut refined, bx1, by1, bx2, by2);
+            }
+        }
+    }
+
+    for &(_, mut x1, mut y1, mut x2, mut y2) in raw_candidates.iter() {
+        if refined.len() >= 32 {
+            break;
+        }
+        let c_area = (x2 - x1) * (y2 - y1);
+        if refined.iter().any(|&(ex1, ey1, ex2, ey2)| {
             let iw = (x2.min(ex2) - x1.max(ex1)).max(0.0);
             let ih = (y2.min(ey2) - y1.max(ey1)).max(0.0);
-            iw * ih < (x2 - x1) * (y2 - y1) * 0.65
+            iw * ih >= c_area * 0.85
         }) {
             continue;
         }
@@ -540,17 +643,9 @@ pub fn extract_macro_cavity_holes(
             continue;
         }
         let (ax1, ay1, ax2, ay2) = expand_rect(x1, y1, x2, y2, true);
+        push_refined(&mut refined, ax1, ay1, ax2, ay2);
         let (bx1, by1, bx2, by2) = expand_rect(x1, y1, x2, y2, false);
-        let (fx1, fy1, fx2, fy2) = if (ax2 - ax1) * (ay2 - ay1) >= (bx2 - bx1) * (by2 - by1) {
-            (ax1, ay1, ax2, ay2)
-        } else {
-            (bx1, by1, bx2, by2)
-        };
-        let fw = fx2 - fx1;
-        let fh = fy2 - fy1;
-        if fw.min(fh) >= 40.0 && fw.max(fh) >= 100.0 && fw * fh >= 8000.0 {
-            refined.push((fx1, fy1, fx2, fy2));
-        }
+        push_refined(&mut refined, bx1, by1, bx2, by2);
     }
 
     refined.sort_by(|a, b| {
@@ -565,30 +660,15 @@ pub fn extract_macro_cavity_holes(
         let overlaps = primary_pockets.iter().any(|&(ex1, ey1, ex2, ey2)| {
             let iw = (x2.min(ex2) - x1.max(ex1)).max(0.0);
             let ih = (y2.min(ey2) - y1.max(ey1)).max(0.0);
-            iw * ih > area * 0.35
+            iw * ih > area * 0.90
         });
         if !overlaps {
             primary_pockets.push((x1, y1, x2, y2));
+            if primary_pockets.len() >= 24 {
+                break;
+            }
         }
     }
-
-    let is_deep_inner_safe = |dx1: f64, dy1: f64, dx2: f64, dy2: f64, open_t: bool, open_b: bool, open_l: bool, open_r: bool| -> bool {
-        let c = 7.0;
-        let ix1 = if open_l { dx1 + 0.2 } else { dx1 + c };
-        let ix2 = if open_r { dx2 - 0.2 } else { dx2 - c };
-        let iy1 = if open_b { dy1 + 0.2 } else { dy1 + c };
-        let iy2 = if open_t { dy2 - 0.2 } else { dy2 - c };
-        if ix2 - ix1 < 20.0 || iy2 - iy1 < 20.0 {
-            return false;
-        }
-        let inner_poly = Polygon::new(vec![
-            Point::new(ix1, iy1),
-            Point::new(ix2, iy1),
-            Point::new(ix2, iy2),
-            Point::new(ix1, iy2),
-        ]);
-        child_polys.iter().all(|cp| !polygons_collide_concave_safe(&inner_poly, cp, c))
-    };
 
     let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
     for &(x1, y1, x2, y2) in &primary_pockets {
@@ -597,63 +677,12 @@ pub fn extract_macro_cavity_holes(
         let rx2 = if (macro_w - x2) <= 1.5 { round3(macro_w) } else { round3(x2) };
         let ry2 = if (macro_h - y2) <= 1.5 { round3(macro_h) } else { round3(y2) };
         holes.push(vec![[rx1, ry1], [rx2, ry1], [rx2, ry2], [rx1, ry2]]);
-
-        let open_t = ry2 >= macro_h - 1.5;
-        let open_b = ry1 <= 1.5;
-        let open_l = rx1 <= 1.5;
-        let open_r = rx2 >= macro_w - 1.5;
-        if (open_t || open_b) && (rx2 - rx1) >= 124.0 {
-            let inset_x = (((rx2 - rx1) - 121.5) * 0.5).clamp(4.0, 9.0);
-            let dx1 = round3(rx1 + inset_x);
-            let dx2 = round3(rx2 - inset_x);
-            let mut dy1 = ry1;
-            let mut dy2 = ry2;
-            for &step in &[16.0, 8.0, 4.0, 2.0, 1.0, 0.5] {
-                if open_t {
-                    while dy1 - step >= 0.0 && is_deep_inner_safe(dx1, dy1 - step, dx2, dy2, open_t, open_b, false, false) {
-                        dy1 -= step;
-                    }
-                }
-                if open_b {
-                    while dy2 + step <= macro_h && is_deep_inner_safe(dx1, dy1, dx2, dy2 + step, open_t, open_b, false, false) {
-                        dy2 += step;
-                    }
-                }
-            }
-            if (ry1 - dy1) >= 4.0 || (dy2 - ry2) >= 4.0 {
-                let rdy1 = round3(dy1);
-                let rdy2 = round3(dy2);
-                holes.push(vec![[dx1, rdy1], [dx2, rdy1], [dx2, rdy2], [dx1, rdy2]]);
-            }
-        } else if (open_l || open_r) && (ry2 - ry1) >= 124.0 {
-            let inset_y = (((ry2 - ry1) - 121.5) * 0.5).clamp(4.0, 9.0);
-            let dy1 = round3(ry1 + inset_y);
-            let dy2 = round3(ry2 - inset_y);
-            let mut dx1 = rx1;
-            let mut dx2 = rx2;
-            for &step in &[16.0, 8.0, 4.0, 2.0, 1.0, 0.5] {
-                if open_r {
-                    while dx1 - step >= 0.0 && is_deep_inner_safe(dx1 - step, dy1, dx2, dy2, false, false, open_l, open_r) {
-                        dx1 -= step;
-                    }
-                }
-                if open_l {
-                    while dx2 + step <= macro_w && is_deep_inner_safe(dx1, dy1, dx2 + step, dy2, false, false, open_l, open_r) {
-                        dx2 += step;
-                    }
-                }
-            }
-            if (rx1 - dx1) >= 4.0 || (dx2 - rx2) >= 4.0 {
-                let rdx1 = round3(dx1);
-                let rdx2 = round3(dx2);
-                holes.push(vec![[rdx1, dy1], [rdx2, dy1], [rdx2, dy2], [rdx1, dy2]]);
-            }
-        }
     }
 
     if holes.is_empty() {
         None
     } else {
+        holes.truncate(24);
         Some(holes)
     }
 }
@@ -1185,6 +1214,20 @@ fn build_stack_profile_contour(
     macro_w: f64,
     macro_h: f64,
 ) -> Vec<[f64; 2]> {
+    let _round3 = |v: f64| (v * 1000.0).round() / 1000.0;
+
+    let shifted_polys: Vec<Polygon> = (0..count)
+        .map(|k| base_poly.translate((k as f64 * dx) - min_x, (k as f64 * dy) - min_y))
+        .collect();
+
+    build_polys_profile_contour(&shifted_polys, macro_w, macro_h)
+}
+
+pub fn build_polys_profile_contour(
+    shifted_polys: &[Polygon],
+    macro_w: f64,
+    macro_h: f64,
+) -> Vec<[f64; 2]> {
     let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
     let rect_fallback = vec![
         [0.0, 0.0],
@@ -1192,21 +1235,17 @@ fn build_stack_profile_contour(
         [macro_w, macro_h],
         [0.0, macro_h],
     ];
-    if count < 2 || macro_w < 20.0 || macro_h < 20.0 || base_poly.points.len() < 3 {
+    if shifted_polys.len() < 2 || macro_w < 20.0 || macro_h < 20.0 {
         return rect_fallback;
     }
 
-    let shifted_polys: Vec<Polygon> = (0..count)
-        .map(|k| base_poly.translate((k as f64 * dx) - min_x, (k as f64 * dy) - min_y))
-        .collect();
-
-    let num_slices = 16usize;
+    let num_slices = 36usize;
 
     // 1. X-slice envelope (vertical slices along [0, macro_w])
     let step_x = macro_w / (num_slices as f64);
     let mut bot_y = vec![macro_h; num_slices];
     let mut top_y = vec![0.0f64; num_slices];
-    for sp in &shifted_polys {
+    for sp in shifted_polys {
         let n = sp.points.len();
         for i in 0..n {
             let p1 = sp.points[i];
@@ -1267,7 +1306,7 @@ fn build_stack_profile_contour(
     let step_y = macro_h / (num_slices as f64);
     let mut left_x = vec![macro_w; num_slices];
     let mut right_x = vec![0.0f64; num_slices];
-    for sp in &shifted_polys {
+    for sp in shifted_polys {
         let n = sp.points.len();
         for i in 0..n {
             let p1 = sp.points[i];
@@ -1328,7 +1367,11 @@ fn build_stack_profile_contour(
     let x_area = x_poly.area();
     let y_area = y_poly.area();
 
-    let best_poly = if x_poly.points.len() >= 4 && x_area > 1.0 && (x_area <= y_area || y_poly.points.len() < 4) {
+    let best_poly = if macro_h >= macro_w * 1.15 && y_poly.points.len() >= 4 && y_area > 1.0 && y_area < rect_area * 0.96 {
+        Some((y_poly, y_area))
+    } else if macro_w >= macro_h * 1.15 && x_poly.points.len() >= 4 && x_area > 1.0 && x_area < rect_area * 0.96 {
+        Some((x_poly, x_area))
+    } else if x_poly.points.len() >= 4 && x_area > 1.0 && (x_area <= y_area || y_poly.points.len() < 4) {
         Some((x_poly, x_area))
     } else if y_poly.points.len() >= 4 && y_area > 1.0 {
         Some((y_poly, y_area))
@@ -1415,7 +1458,7 @@ pub fn create_parallel_nested_stack_macro(
                 || p.grain_arrow_degrees.is_some()
         });
 
-    let macro_base_rot = first.base_rotation_degrees.or(first.rotation_degrees).unwrap_or(0.0);
+    let macro_base_rot = 0.0;
     let ref_grain_arrow = first.grain_arrow_degrees;
 
     let total_area: f64 = stack_parts.iter().map(|p| p.area.unwrap_or(0.0)).sum();
@@ -1427,17 +1470,26 @@ pub fn create_parallel_nested_stack_macro(
 
     let macro_w = round3(stack_w);
     let macro_h = round3(stack_h);
-    let profile_contour = build_stack_profile_contour(
-        &poly,
-        stack_parts.len(),
-        dx,
-        dy,
-        min_x,
-        min_y,
-        macro_w,
-        macro_h,
-    );
     let macro_holes = extract_macro_cavity_holes(&children, macro_w, macro_h);
+    let profile_contour = if macro_holes.is_some() {
+        vec![
+            [0.0, 0.0],
+            [macro_w, 0.0],
+            [macro_w, macro_h],
+            [0.0, macro_h],
+        ]
+    } else {
+        build_stack_profile_contour(
+            &poly,
+            stack_parts.len(),
+            dx,
+            dy,
+            min_x,
+            min_y,
+            macro_w,
+            macro_h,
+        )
+    };
 
     PartInput {
         entity_id: Some(macro_eid),
@@ -1479,6 +1531,132 @@ pub fn create_parallel_nested_stack_macro(
     }
 }
 
+pub fn create_concentric_arch_macro(
+    parts: &[PartInput],
+    placements: &[(usize, f64, f64)],
+    config: Option<&ConfigurationInput>,
+) -> PartInput {
+    let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
+    let first = &parts[placements[0].0];
+
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+
+    for &(idx, ox, oy) in placements {
+        let poly = Polygon::from_raw(&parts[idx].contour);
+        let bbox = poly.bounding_box();
+        min_x = min_x.min(bbox.min_x + ox);
+        max_x = max_x.max(bbox.max_x + ox);
+        min_y = min_y.min(bbox.min_y + oy);
+        max_y = max_y.max(bbox.max_y + oy);
+    }
+
+    let stack_w = max_x - min_x;
+    let stack_h = max_y - min_y;
+
+    let mut children = Vec::with_capacity(placements.len());
+    let mut shifted_polys = Vec::with_capacity(placements.len());
+    for &(idx, ox, oy) in placements {
+        let p = &parts[idx];
+        let nx = ox - min_x;
+        let ny = oy - min_y;
+        shifted_polys.push(Polygon::from_raw(&p.contour).translate(nx, ny));
+        children.push(ClusterChild {
+            entity_id: p.entity_id.clone(),
+            id: p.id.clone(),
+            name: p.name.clone(),
+            offset_x: Some(round3(nx)),
+            offset_y: Some(round3(ny)),
+            rotation_degrees: Some(0.0),
+            width: p.width,
+            height: p.height,
+            area: p.area,
+            contour: Some(p.contour.clone()),
+            holes: p.holes.clone(),
+            render_contour: p.render_contour.clone(),
+            render_holes: p.render_holes.clone(),
+            collision_contour: p.collision_contour.clone(),
+            collision_holes: p.collision_holes.clone(),
+            color: p.color.clone(),
+            draw_layers: p.draw_layers.clone(),
+            has_grain_label: p.has_grain_label,
+            grain_arrow_degrees: p.grain_arrow_degrees,
+            base_rotation_degrees: p.base_rotation_degrees,
+            two_sided: p.two_sided,
+            manual_cluster_child: None,
+        });
+    }
+
+    let global_grain_locked = config.and_then(|c| c.rotation_divisions).map_or(true, |d| d <= 2);
+    let is_grain_locked = global_grain_locked
+        || placements.iter().any(|&(idx, _, _)| {
+            let p = &parts[idx];
+            p.grain_locked == Some(true)
+                || p.has_grain_label == Some(true)
+                || p.grain_arrow_degrees.is_some()
+        });
+
+    let cx0 = shifted_polys[0].points.iter().map(|pt| pt.x).sum::<f64>()
+        / (shifted_polys[0].points.len().max(1) as f64);
+    let prefer_180 = cx0 < stack_w * 0.5;
+    let macro_base_rot = 0.0;
+    let pref_rot = if prefer_180 { 180.0 } else { 0.0 };
+    let alt_rot = if prefer_180 { 0.0 } else { 180.0 };
+    let ref_grain_arrow = first.grain_arrow_degrees;
+
+    let total_area: f64 = placements.iter().map(|&(idx, _, _)| parts[idx].area.unwrap_or(0.0)).sum();
+    let first_name = first.name.as_deref().unwrap_or("Part");
+    let macro_name = format!("Cụm cong đồng tâm: {} ({} chi tiết)", first_name, placements.len());
+    let child_ids: Vec<&str> = placements.iter().map(|&(idx, _, _)| parts[idx].id.as_deref().unwrap_or("")).collect();
+    let macro_id = child_ids.join("+");
+    let macro_eid = format!("arc-macro:{}", macro_id);
+
+    let macro_w = round3(stack_w);
+    let macro_h = round3(stack_h);
+    let macro_holes = extract_macro_cavity_holes(&children, macro_w, macro_h);
+    let profile_contour = if macro_holes.is_some() {
+        vec![[0.0, 0.0], [macro_w, 0.0], [macro_w, macro_h], [0.0, macro_h]]
+    } else {
+        build_polys_profile_contour(&shifted_polys, macro_w, macro_h)
+    };
+
+    PartInput {
+        entity_id: Some(macro_eid),
+        id: Some(macro_id),
+        name: Some(macro_name),
+        width: Some(macro_w),
+        height: Some(macro_h),
+        area: Some(round3(total_area)),
+        contour: profile_contour,
+        holes: macro_holes,
+        render_contour: None,
+        render_holes: None,
+        collision_contour: None,
+        collision_holes: None,
+        draw_layers: None,
+        rotations: if is_grain_locked {
+            Some(vec![pref_rot])
+        } else {
+            Some(vec![pref_rot, 90.0, alt_rot, 270.0])
+        },
+        base_rotation_degrees: Some(macro_base_rot),
+        rotation_degrees: Some(pref_rot),
+        grain_locked: Some(is_grain_locked),
+        has_grain_label: Some(is_grain_locked),
+        grain_arrow_degrees: if is_grain_locked { ref_grain_arrow } else { None },
+        free_rotation: Some(!is_grain_locked),
+        rotation_divisions: Some(if is_grain_locked { 2 } else { 4 }),
+        color: first.color.clone(),
+        logical_part_count: Some(placements.len()),
+        manual_cluster_macro: Some(true),
+        manual_cluster_children: Some(children),
+        two_sided: Some(placements.iter().any(|&(idx, _, _)| parts[idx].two_sided == Some(true))),
+        has_circular_arc: Some(false),
+    }
+}
+
 pub fn compute_shape_signature(part: &PartInput) -> String {
     let poly = Polygon::from_raw(&part.contour);
     let clean = simplify_collinear(&poly.points, 0.5);
@@ -1486,12 +1664,13 @@ pub fn compute_shape_signature(part: &PartInput) -> String {
     let (norm_poly, _, _) = poly_ccw.normalize_to_origin();
     let bbox = norm_poly.bounding_box();
     let area = part.area.unwrap_or_else(|| poly.area());
+    let quant_area = ((area / 5.0).round() * 5.0).max(1.0);
 
     let mut sig = format!(
         "{:.1}_{:.1}_{:.0}_{}_",
         (bbox.width() * 2.0).round() / 2.0,
         (bbox.height() * 2.0).round() / 2.0,
-        area.round(),
+        quant_area,
         norm_poly.points.len()
     );
     let n = norm_poly.points.len();
@@ -1625,8 +1804,277 @@ pub fn pair_comb_parts(
         diff == 0
     };
 
+    // Phase 0: Concentric multi-size arch stacking across compatible curved-arch families
+    let mut arch_cand_indices: Vec<usize> = Vec::new();
+    let mut decimated_polys: HashMap<usize, (Polygon, crate::geometry::Rect)> = HashMap::new();
+    for &idx in &candidate_indices {
+        let poly = Polygon::from_raw(&parts[idx].contour);
+        let bbox = poly.bounding_box();
+        let area = parts[idx].area.unwrap_or_else(|| poly.area());
+        let box_area = bbox.area().max(1.0);
+        if bbox.height().max(bbox.width()) >= 900.0
+            && bbox.width().min(bbox.height()) >= 280.0
+            && area / box_area <= 0.48
+        {
+            let dec = if poly.points.len() > 64 {
+                decimate_curved_polygon(&poly.points, 4.0)
+            } else {
+                poly
+            };
+            decimated_polys.insert(idx, (dec, bbox));
+            arch_cand_indices.push(idx);
+        }
+    }
+
+    if arch_cand_indices.len() >= 6 {
+        let mut by_chirality: BTreeMap<(bool, i64, bool), Vec<usize>> = BTreeMap::new();
+        for &idx in &arch_cand_indices {
+            let (ref poly, ref bbox) = decimated_polys[&idx];
+            let cx = poly.points.iter().map(|pt| pt.x).sum::<f64>() / (poly.points.len().max(1) as f64);
+            let is_left_spine = cx < bbox.width() * 0.5;
+            let r = parts[idx].base_rotation_degrees.or(parts[idx].rotation_degrees).unwrap_or(0.0).round() as i64 % 360;
+            let ts = parts[idx].two_sided == Some(true);
+            by_chirality.entry((is_left_spine, r, ts)).or_default().push(idx);
+        }
+
+        for ((is_left_spine, _rot_key, _ts_key), mut grp_indices) in by_chirality {
+            if grp_indices.len() < 6 {
+                continue;
+            }
+            let mut distinct_sigs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut max_arch_h = 0.0_f64;
+            for &idx in &grp_indices {
+                distinct_sigs.insert(&signatures[idx]);
+                max_arch_h = max_arch_h.max(decimated_polys[&idx].1.height());
+            }
+            if distinct_sigs.len() < 2 {
+                continue;
+            }
+
+            grp_indices.sort_by(|&a, &b| {
+                let ba = &decimated_polys[&a].1;
+                let bb = &decimated_polys[&b].1;
+                bb.height()
+                    .partial_cmp(&ba.height())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| bb.width().partial_cmp(&ba.width()).unwrap_or(std::cmp::Ordering::Equal))
+            });
+
+            let mut tall_indices = Vec::new();
+            let mut short_indices = Vec::new();
+            for &idx in &grp_indices {
+                if decimated_polys[&idx].1.height() >= max_arch_h * 0.88 {
+                    tall_indices.push(idx);
+                } else {
+                    short_indices.push(idx);
+                }
+            }
+
+            let belly_reserve = if !short_indices.is_empty() { 95.0 } else { 0.0 };
+            let tall_max_w = (max_bw - belly_reserve).max(max_bw * 0.75);
+
+            let find_arch_pos = |stack: &[(usize, f64, f64)], cand_idx: usize, limit_w: f64, is_tall: bool| -> Option<(f64, f64)> {
+                let (ref cand_poly, ref cand_bbox) = decimated_polys[&cand_idx];
+                let cw = cand_bbox.width();
+                let ch = cand_bbox.height();
+                if cw > limit_w || ch > max_bh {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(if is_left_spine { (0.0, 0.0) } else { (max_bw - cw, 0.0) });
+                }
+                let mut cur_min_x = f64::INFINITY;
+                let mut cur_max_x = f64::NEG_INFINITY;
+                let mut cur_min_y = f64::INFINITY;
+                let mut cur_max_y = f64::NEG_INFINITY;
+                for &(e_idx, ex, ey) in stack {
+                    let eb = &decimated_polys[&e_idx].1;
+                    cur_min_x = cur_min_x.min(ex);
+                    cur_max_x = cur_max_x.max(ex + eb.width());
+                    cur_min_y = cur_min_y.min(ey);
+                    cur_max_y = cur_max_y.max(ey + eb.height());
+                }
+
+                let y_cands: &[f64] = if is_tall {
+                    &[0.0, 5.0, 10.0, 12.0, 15.0, 20.0, 25.0]
+                } else {
+                    &[150.0, 165.0, 180.0, 195.0, 210.0, 230.0, 250.0, 270.0, 290.0, 310.0, 317.0, 325.0, 335.0, 345.0, 130.0, 100.0, 60.0, 0.0]
+                };
+
+                let is_pos_valid = |x: f64, y: f64| -> bool {
+                    let n_min_x = cur_min_x.min(x);
+                    let n_max_x = cur_max_x.max(x + cw);
+                    let n_min_y = cur_min_y.min(y);
+                    let n_max_y = cur_max_y.max(y + ch);
+                    if n_max_x - n_min_x > limit_w + 1e-3 || n_max_y - n_min_y > max_bh + 1e-3 {
+                        return false;
+                    }
+                    let c_shifted = cand_poly.translate(x, y);
+                    for &(e_idx, ex, ey) in stack.iter().rev() {
+                        let (ref e_poly, ref eb) = decimated_polys[&e_idx];
+                        if x + cw + spacing <= ex || ex + eb.width() + spacing <= x || y + ch + spacing <= ey || ey + eb.height() + spacing <= y {
+                            continue;
+                        }
+                        let e_shifted = e_poly.translate(ex, ey);
+                        if polygons_collide_concave_safe(&c_shifted, &e_shifted, spacing) {
+                            return false;
+                        }
+                    }
+                    true
+                };
+
+                let ideal_y = ((max_arch_h - ch) * 0.5).max(0.0);
+                let mut best: Option<(f64, f64, f64)> = None;
+                for &y in y_cands {
+                    if y + ch > max_bh {
+                        continue;
+                    }
+                    if is_left_spine {
+                        let start_x = stack.last().map_or(0.0, |&(last_idx, lx, _)| {
+                            if decimated_polys[&last_idx].1.height() <= ch + 10.0 { (lx + 40.0).max(0.0) } else { (lx + 20.0).max(0.0) }
+                        });
+                        let mut x = start_x;
+                        while x <= max_bw - cw {
+                            if is_pos_valid(x, y) {
+                                while x - 1.0 >= start_x && is_pos_valid(x - 1.0, y) {
+                                    x -= 1.0;
+                                }
+                                let span_w = cur_max_x.max(x + cw) - cur_min_x.min(x);
+                                let score = x + span_w * 0.25 + (y - ideal_y).abs() * 0.02;
+                                if best.map_or(true, |b| score < b.2 - 0.1) {
+                                    best = Some((x, y, score));
+                                }
+                                break;
+                            }
+                            x += 4.0;
+                        }
+                    } else {
+                        let start_x = stack.last().map_or(max_bw - cw, |&(last_idx, lx, _)| {
+                            let lw = decimated_polys[&last_idx].1.width();
+                            if decimated_polys[&last_idx].1.height() <= ch + 10.0 {
+                                (lx + lw - cw - 40.0).min(max_bw - cw)
+                            } else {
+                                (lx + lw - cw - 20.0).min(max_bw - cw)
+                            }
+                        });
+                        let mut x = start_x;
+                        while x >= 0.0 {
+                            if is_pos_valid(x, y) {
+                                while x + 1.0 <= start_x && is_pos_valid(x + 1.0, y) {
+                                    x += 1.0;
+                                }
+                                let span_w = cur_max_x.max(x + cw) - cur_min_x.min(x);
+                                let score = (max_bw - (x + cw)) + span_w * 0.25 + (y - ideal_y).abs() * 0.02;
+                                if best.map_or(true, |b| score < b.2 - 0.1) {
+                                    best = Some((x, y, score));
+                                }
+                                break;
+                            }
+                            x -= 4.0;
+                        }
+                    }
+                }
+                best.map(|(bx, by, _)| (bx, by))
+            };
+
+            let target_stacks = ((tall_indices.len() + 5) / 6).max(2);
+            let mut stacks: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); target_stacks];
+            let mut tall_rr = 0usize;
+            for &idx in &tall_indices {
+                let mut placed_in_stack = false;
+                let n_st = stacks.len();
+                for offset in 0..n_st {
+                    let s_idx = (tall_rr + offset) % n_st;
+                    if stacks[s_idx].len() >= 7 {
+                        continue;
+                    }
+                    if let Some((px, py)) = find_arch_pos(&stacks[s_idx], idx, tall_max_w, true) {
+                        stacks[s_idx].push((idx, px, py));
+                        tall_rr = (s_idx + 1) % n_st;
+                        placed_in_stack = true;
+                        break;
+                    }
+                }
+                if !placed_in_stack {
+                    for s_idx in 0..stacks.len() {
+                        if let Some((px, py)) = find_arch_pos(&stacks[s_idx], idx, max_bw, true) {
+                            stacks[s_idx].push((idx, px, py));
+                            placed_in_stack = true;
+                            break;
+                        }
+                    }
+                }
+                if !placed_in_stack {
+                    let mut st = Vec::new();
+                    if let Some((px, py)) = find_arch_pos(&st, idx, max_bw, true) {
+                        st.push((idx, px, py));
+                        stacks.push(st);
+                    }
+                }
+            }
+            stacks.retain(|st| !st.is_empty());
+
+            let short_tight_w = (max_bw - 73.0).max(tall_max_w);
+            let mut leftover_short = Vec::new();
+            let mut rr_cursor = 0usize;
+            for &idx in &short_indices {
+                let mut placed_short = false;
+                if !stacks.is_empty() {
+                    let n_st = stacks.len();
+                    for &lim_w in &[short_tight_w, max_bw] {
+                        for offset in 0..n_st {
+                            let s_idx = (rr_cursor + offset) % n_st;
+                            if let Some((px, py)) = find_arch_pos(&stacks[s_idx], idx, lim_w, false) {
+                                stacks[s_idx].push((idx, px, py));
+                                rr_cursor = (s_idx + 1) % n_st;
+                                placed_short = true;
+                                break;
+                            }
+                        }
+                        if placed_short {
+                            break;
+                        }
+                    }
+                }
+                if !placed_short {
+                    leftover_short.push(idx);
+                }
+            }
+
+            for idx in leftover_short {
+                let mut placed_lo = false;
+                for st in stacks.iter_mut() {
+                    if let Some((px, py)) = find_arch_pos(st, idx, max_bw, false) {
+                        st.push((idx, px, py));
+                        placed_lo = true;
+                        break;
+                    }
+                }
+                if !placed_lo {
+                    let mut st = Vec::new();
+                    if let Some((px, py)) = find_arch_pos(&st, idx, max_bw, false) {
+                        st.push((idx, px, py));
+                        stacks.push(st);
+                    }
+                }
+            }
+
+            for st in stacks {
+                if st.len() >= 2 {
+                    let macro_p = create_concentric_arch_macro(parts, &st, Some(config));
+                    macro_parts.push(macro_p);
+                    for &(idx, _, _) in &st {
+                        used[idx] = true;
+                    }
+                    comb_count += 1;
+                }
+            }
+        }
+    }
+
     // Phase 1: Self-mating within identical shape families O(N)
     for (_sig, indices) in groups_by_sig.iter_mut() {
+        indices.retain(|&idx| !used[idx]);
         if indices.len() >= 2 {
             // Group two-sided parts and same-room parts together first so they pair cleanly with each other
             indices.sort_by(|&a, &b| {
@@ -1665,13 +2113,14 @@ pub fn pair_comb_parts(
                         } else if remaining == 7 {
                             4
                         } else {
-                            remaining.min(6)
+                            remaining.min(8)
                         };
                         while chunk_size > 2 {
                             let (sw, sh) = compute_stack_dimensions(&poly_first, chunk_size, dx, dy);
                             let fits_normal = sw <= max_bw && sh <= max_bh;
                             let fits_rotated = sw <= max_bh && sh <= max_bw;
-                            let fits_half_long = !deep_cardinal_batch || chunk_size <= 6 || sw.max(sh) <= half_long_board;
+                            let stack_span = if dx.abs() >= dy.abs() { sw } else { sh };
+                            let fits_half_long = !deep_cardinal_batch || chunk_size <= 6 || stack_span <= half_long_board;
                             if fits_half_long && (fits_normal || (!global_grain_locked && fits_rotated)) {
                                 break;
                             }
@@ -1710,16 +2159,23 @@ pub fn pair_comb_parts(
                     || parts[indices[1]].has_circular_arc == Some(true)
                     || p_a.points.len() >= 8
                     || (orig_boxes_area > 1.0 && total_parts_area / orig_boxes_area < 0.65);
-                let saving_thresh = if is_arc_or_hollow { 0.98 } else { 0.85 };
+                let saving_thresh = if is_arc_or_hollow { 0.94 } else { 0.90 };
                 let is_compact_saving = orig_boxes_area > 1.0 && macro_box <= orig_boxes_area * saving_thresh;
-                let min_threshold = if is_compact_saving {
-                    if is_arc_or_hollow { 0.15 } else { 0.25 }
-                } else {
-                    0.65
-                };
-                if offsets.fill_rate >= min_threshold {
+                let is_partial_batch_saving = !is_compact_saving
+                    && is_arc_or_hollow
+                    && indices.len() >= 16
+                    && orig_boxes_area > 1.0
+                    && macro_box <= orig_boxes_area * 0.98
+                    && offsets.fill_rate >= 0.65;
+                let min_threshold = if is_arc_or_hollow { 0.15 } else { 0.25 };
+                if (is_compact_saving || is_partial_batch_saving) && offsets.fill_rate >= min_threshold {
+                    let max_pair_idx = if is_partial_batch_saving {
+                        ((indices.len() * 7) / 10) & !1
+                    } else {
+                        indices.len()
+                    };
                     let mut i = 0;
-                    while i + 1 < indices.len() {
+                    while i + 1 < max_pair_idx {
                         let idx_a = indices[i];
                         let idx_b = indices[i + 1];
                         if !is_pair_grain_compatible(idx_a, idx_b, &offsets) {
