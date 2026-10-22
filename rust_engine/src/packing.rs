@@ -94,13 +94,12 @@ pub fn prepare_parts(
         let source_width = p.width.filter(|v| *v > 1e-6).unwrap_or_else(|| orig_bbox.width());
         let source_height = p.height.filter(|v| *v > 1e-6).unwrap_or_else(|| orig_bbox.height());
         let is_macro = p.manual_cluster_macro == Some(true);
-        let merge_cut = config.merge_cut_paths.unwrap_or(false);
         let small_part = !is_macro
             && small_part_threshold > 0.001
             && source_width > 0.001
             && source_height > 0.001
             && source_width.min(source_height) <= small_part_threshold + 0.001
-            && (merge_cut || source_width.max(source_height) < 100.0 || area < 4500.0);
+            && (source_width.max(source_height) < 100.0 || area < 4500.0);
         let small_part_clearance = if small_part && configured_small_part_clearance > 0.001 {
             spacing.max(configured_small_part_clearance)
         } else {
