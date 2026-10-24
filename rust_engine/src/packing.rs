@@ -98,7 +98,8 @@ pub fn prepare_parts(
             && small_part_threshold > 0.001
             && source_width > 0.001
             && source_height > 0.001
-            && source_width.min(source_height) <= small_part_threshold + 0.001;
+            && source_width.min(source_height) <= small_part_threshold + 0.001
+            && (source_width.max(source_height) < 100.0 || area < 4500.0);
         let small_part_clearance = if small_part && configured_small_part_clearance > 0.001 {
             spacing.max(configured_small_part_clearance)
         } else {
