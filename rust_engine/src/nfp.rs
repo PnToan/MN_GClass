@@ -125,7 +125,9 @@ impl SheetContext {
         let left = x.max(0.0);
         let right = (self.width - (x + width)).max(0.0);
         let top = (self.height - (y + height)).max(0.0);
-        left.min(right).min(top) <= zone + 0.001
+        let bottom = y.max(0.0);
+        let in_bottom_zone = bottom < zone && (zone - bottom).min(height) >= height * 0.6 - 0.001;
+        left.min(right).min(top) <= zone + 0.001 || in_bottom_zone
     }
 
     #[inline]
@@ -348,9 +350,10 @@ impl SheetContext {
         let mut candidate_points = Vec::with_capacity((self.placed.len() + self.free_rects.len() + 1) * 10);
 
         // 1. MaxRects Free Rectangles Anchors - strictly placed from bottom-left corner
+        let has_small_parts_on_sheet = candidate_small_part || self.placed.iter().any(|s| s.small_part);
         for r in &self.free_rects {
             if pw <= r.width() + 1e-4 && ph <= r.height() + 1e-4 {
-                if !pull_right && !pull_top && r.min_x > bounds.min_x + 1.0 && ph > 10.0 {
+                if !has_small_parts_on_sheet && !pull_right && !pull_top && r.min_x > bounds.min_x + 1.0 && ph > 10.0 {
                     let rows_r = ((r.height() + self.spacing) / (ph + self.spacing)).floor();
                     if rows_r >= 1.0 && self.free_rects.iter().any(|r2| {
                         r2.min_x < r.min_x - 1.0
