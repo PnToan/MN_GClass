@@ -75,3 +75,79 @@ impl LayoutScore {
         }
     }
 }
+
+pub fn compute_room_dispersion(layout: &LayoutOutput) -> (usize, usize, i64) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let sheet_count = layout.sheets.len();
+    let mut mixed_leading_penalty = 0usize;
+    let mut sheets_per_room: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    let mut intra_sheet_span_mm: i64 = 0;
+
+    for (s_idx, sheet) in layout.sheets.iter().enumerate() {
+        let mut room_boxes: BTreeMap<String, (f64, f64, f64, f64, usize)> = BTreeMap::new();
+        for p in &sheet.placements {
+            let r = crate::types::get_placement_room_key(p);
+            if r.is_empty() {
+                continue;
+            }
+            sheets_per_room.entry(r.clone()).or_default().insert(s_idx);
+            let cx = p.x + p.packed_width * 0.5;
+            let cy = p.y + p.packed_height * 0.5;
+            let entry = room_boxes.entry(r).or_insert((cx, cx, cy, cy, 0));
+            entry.0 = entry.0.min(cx);
+            entry.1 = entry.1.max(cx);
+            entry.2 = entry.2.min(cy);
+            entry.3 = entry.3.max(cy);
+            entry.4 += 1;
+        }
+        if s_idx < sheet_count.saturating_sub(1) && room_boxes.len() > 1 {
+            mixed_leading_penalty += room_boxes.len() - 1;
+        }
+        for (_r, (min_x, max_x, min_y, max_y, count)) in room_boxes {
+            if count >= 2 {
+                intra_sheet_span_mm += ((max_x - min_x) + (max_y - min_y)).round() as i64;
+            }
+        }
+    }
+
+    let room_sheet_splits: usize = sheets_per_room
+        .values()
+        .map(|set| set.len().saturating_sub(1))
+        .sum();
+
+    (mixed_leading_penalty, room_sheet_splits, intra_sheet_span_mm)
+}
+
+pub fn is_room_candidate_better(
+    cand: &LayoutOutput,
+    current_best: &LayoutOutput,
+    baseline_sheets: usize,
+    baseline_underfilled: usize,
+) -> bool {
+    if cand.sheets.is_empty() || cand.sheets.len() > baseline_sheets {
+        return false;
+    }
+    let cand_score = LayoutScore::compute(cand);
+    if cand.sheets.len() == baseline_sheets && cand_score.underfilled_sheets > baseline_underfilled {
+        return false;
+    }
+
+    if cand.sheets.len() != current_best.sheets.len() {
+        return cand.sheets.len() < current_best.sheets.len();
+    }
+    let best_score = LayoutScore::compute(current_best);
+    if cand_score.underfilled_sheets != best_score.underfilled_sheets {
+        return cand_score.underfilled_sheets < best_score.underfilled_sheets;
+    }
+
+    let disp_cand = compute_room_dispersion(cand);
+    let disp_best = compute_room_dispersion(current_best);
+    if disp_cand != disp_best {
+        return disp_cand < disp_best;
+    }
+
+    cand_score < best_score
+}
+
+
