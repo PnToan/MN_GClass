@@ -2,7 +2,7 @@
 use rayon::prelude::*;
 use crate::geometry::{Point, Polygon};
 use crate::nfp::SheetContext;
-use crate::packing::{pack_material, pack_material_streaming, norm_angle};
+use crate::packing::{pack_material, norm_angle};
 use crate::scoring::LayoutScore;
 use crate::types::{LayoutOutput, MaterialStateInput, SheetOutput};
 
@@ -113,8 +113,26 @@ pub fn consolidate_sheets(
                 };
 
                 let mut moved = false;
+                let p_room = crate::types::get_placement_room_key(&p);
+                let mut target_order: Vec<usize> = (0..src_idx).collect();
+                if !p_room.is_empty() {
+                    target_order.sort_by_key(|&t_idx| {
+                        let has_same = layout.sheets[t_idx].placements.iter().any(|ep| crate::types::get_placement_room_key(ep) == p_room);
+                        let has_other = layout.sheets[t_idx].placements.iter().any(|ep| {
+                            let er = crate::types::get_placement_room_key(ep);
+                            !er.is_empty() && er != p_room
+                        });
+                        if has_same && !has_other {
+                            0usize
+                        } else if has_same {
+                            1usize
+                        } else {
+                            2usize
+                        }
+                    });
+                }
 
-                for target_idx in 0..src_idx {
+                for target_idx in target_order {
                     if board_area - sheet_used_area[target_idx] < p_area * 1.05 {
                         continue;
                     }
@@ -332,6 +350,7 @@ fn pack_sub_state_best(
     let comb_count = existing_macro_count + new_comb_count;
     let prepared = crate::packing::prepare_parts(&paired_parts, &config, part_spacing);
 
+    let has_room_strat = strategies.iter().any(|&s| s >= 100);
     let mut best: Option<LayoutOutput> = None;
     for &strat_id in strategies {
         let mut cand = crate::packing::pack_material_with_prepared(sub_state, &prepared, comb_count, strat_id);
@@ -340,7 +359,14 @@ fn pack_sub_state_best(
         match &best {
             None => best = Some(cand),
             Some(curr) => {
-                if LayoutScore::compute(&cand) < LayoutScore::compute(curr) {
+                let take = if has_room_strat {
+                    let max_s = curr.sheets.len().max(cand.sheets.len());
+                    let max_uf = crate::scoring::effective_room_underfilled(curr).max(crate::scoring::effective_room_underfilled(&cand));
+                    crate::scoring::is_room_candidate_better(&cand, curr, max_s, max_uf)
+                } else {
+                    LayoutScore::compute(&cand) < LayoutScore::compute(curr)
+                };
+                if take {
                     best = Some(cand);
                 }
             }
@@ -377,12 +403,20 @@ fn pack_sub_state_parallel(
         })
         .collect();
 
+    let has_room_strat = strategies.iter().any(|&s| s >= 100);
     let mut best: Option<LayoutOutput> = None;
     for cand in cands {
         match &best {
             None => best = Some(cand),
             Some(curr) => {
-                if LayoutScore::compute(&cand) < LayoutScore::compute(curr) {
+                let take = if has_room_strat {
+                    let max_s = curr.sheets.len().max(cand.sheets.len());
+                    let max_uf = crate::scoring::effective_room_underfilled(curr).max(crate::scoring::effective_room_underfilled(&cand));
+                    crate::scoring::is_room_candidate_better(&cand, curr, max_s, max_uf)
+                } else {
+                    LayoutScore::compute(&cand) < LayoutScore::compute(curr)
+                };
+                if take {
                     best = Some(cand);
                 }
             }
@@ -664,7 +698,7 @@ fn try_room_subbatched_layout_fast(
         if lock_mode == 1 && (!has_single_dense_room || (improved && best_cand.sheets.len() <= baseline_sheets)) {
             break;
         }
-        if start_mat.elapsed().as_secs_f64() >= 9.4 {
+        if lock_mode == 1 && start_mat.elapsed().as_secs_f64() >= 9.6 {
             break;
         }
         let mut locked_sheets: Vec<SheetOutput> = Vec::new();
@@ -674,7 +708,7 @@ fn try_room_subbatched_layout_fast(
             let s_len = r_layout.sheets.len();
             let keep_count = if s_len > 1 {
                 s_len - 1
-            } else if s_len == 1 && lock_mode == 0 && r_layout.sheets[0].used_percent >= 78.0 {
+            } else if s_len == 1 && lock_mode == 0 && r_layout.sheets[0].used_percent >= 65.0 {
                 1
             } else {
                 0
@@ -708,7 +742,7 @@ fn try_room_subbatched_layout_fast(
             tail_state.parts = tail_pool.clone();
             let tail_layout = pack_sub_state_parallel(
                 &tail_state,
-                &[100, 0],
+                &[100, 101, 103, 0],
                 global_rot_div,
                 sheet_in_sheet,
                 compact_directions,
@@ -728,8 +762,10 @@ fn try_room_subbatched_layout_fast(
 
         let mut cand_layout = baseline_layout.clone();
         cand_layout.sheets = merged_sheets;
-        if cand_layout.sheets.len() > baseline_sheets {
-            consolidate_sheets(&mut cand_layout, global_rot_div, sheet_in_sheet, compact_directions);
+        while cand_layout.sheets.len() > baseline_sheets {
+            if !consolidate_sheets(&mut cand_layout, global_rot_div, sheet_in_sheet, compact_directions) {
+                break;
+            }
         }
         prioritize_two_sided_sheets(&mut cand_layout.sheets);
 
@@ -759,7 +795,7 @@ fn try_room_subbatched_layout_fast(
                     rem_state.parts = rem_tail_parts;
                     let rem_layout = pack_sub_state_parallel(
                         &rem_state,
-                        &[100, 0],
+                        &[100, 101, 103, 0],
                         global_rot_div,
                         sheet_in_sheet,
                         compact_directions,
@@ -780,6 +816,20 @@ fn try_room_subbatched_layout_fast(
                 best_cand = backfill_layout;
                 improved = true;
             }
+        }
+    }
+
+    if start_mat.elapsed().as_secs_f64() < 9.5 {
+        let aff_layout = pack_sub_state_parallel(
+            paired_material_state,
+            &[100, 101, 102, 103],
+            global_rot_div,
+            sheet_in_sheet,
+            compact_directions,
+        );
+        if crate::scoring::is_room_candidate_better(&aff_layout, &best_cand, baseline_sheets, baseline_underfilled) {
+            best_cand = aff_layout;
+            improved = true;
         }
     }
 
@@ -875,7 +925,9 @@ where
     if num_strategies > 0 && baseline_elapsed < 8.0 {
         let (tx, rx) = std::sync::mpsc::channel();
         (1..=num_strategies).into_par_iter().for_each_with(tx, |s, idx| {
-            let strategy_id = if has_multi_rooms && num_strategies >= 4 && idx == num_strategies - 1 {
+            let strategy_id = if has_multi_rooms && num_strategies >= 4 && idx == num_strategies - 2 {
+                103
+            } else if has_multi_rooms && num_strategies >= 4 && idx == num_strategies - 1 {
                 100
             } else if has_multi_rooms && num_strategies >= 4 && idx == num_strategies {
                 101
@@ -888,18 +940,24 @@ where
         });
 
         let mut completed_count = 0;
+        let phase2_budget = if has_multi_rooms { 7.8 } else { 9.5 };
         while let Ok((_strat_id, mut layout)) = rx.recv() {
             completed_count += 1;
             prioritize_two_sided_sheets(&mut layout.sheets);
-            let score_cand = LayoutScore::compute(&layout);
-            let score_best = LayoutScore::compute(&best_layout);
+            let take = if has_multi_rooms {
+                let max_s = best_layout.sheets.len().max(layout.sheets.len());
+                let max_uf = LayoutScore::compute(&best_layout).underfilled_sheets;
+                crate::scoring::is_room_candidate_better(&layout, &best_layout, max_s, max_uf)
+            } else {
+                LayoutScore::compute(&layout) < LayoutScore::compute(&best_layout)
+            };
             let strategy_pct = 60.0 + (completed_count as f64 / num_strategies as f64) * 35.0;
-            if score_cand < score_best {
+            if take {
                 best_layout = layout;
             }
             on_progress("Tối ưu đa luồng", strategy_pct, completed_count, num_strategies, &best_layout);
 
-            if start_mat.elapsed().as_secs_f64() >= 9.5 {
+            if start_mat.elapsed().as_secs_f64() >= phase2_budget {
                 break;
             }
         }
@@ -968,6 +1026,7 @@ mod tests {
             has_grain_label: Some(true),
             grain_arrow_degrees: Some(0.0),
             grain_locked: Some(true),
+            free_rotation: Some(false),
             small_part: Some(false),
             small_part_clearance: Some(0.0),
             small_part_edge_protected: Some(false),
@@ -1097,6 +1156,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let mat_state = MaterialStateInput {
@@ -1108,6 +1168,7 @@ mod tests {
             original_part_count: Some(2),
             parts: vec![make_tri("1"), make_tri("2")],
             learning_key: None,
+            optimization_seed: None,
         };
 
         let layout = optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});
@@ -1121,6 +1182,96 @@ mod tests {
                     rot
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_multi_room_nesting_groups_rooms_without_extra_sheets() {
+        use crate::types::{clear_room_registry, register_part_room, get_placement_room_key, MaterialStateInput, ConfigurationInput, PartInput};
+        clear_room_registry();
+
+        let make_rect = |id: &str, w: f64, h: f64, room: &str| {
+            let eid = format!("ent_{}", id);
+            register_part_room(Some(id), Some(&eid), Some(room));
+            PartInput {
+                id: Some(id.to_string()),
+                entity_id: Some(eid),
+                name: Some(format!("Panel {}", id)),
+                width: Some(w),
+                height: Some(h),
+                area: Some(w * h),
+                contour: vec![[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]],
+                holes: None,
+                render_contour: None,
+                render_holes: None,
+                collision_contour: None,
+                collision_holes: None,
+                draw_layers: None,
+                rotations: Some(vec![0.0, 180.0]),
+                base_rotation_degrees: Some(0.0),
+                rotation_degrees: Some(0.0),
+                grain_locked: Some(true),
+                has_grain_label: Some(false),
+                grain_arrow_degrees: None,
+                free_rotation: Some(false),
+                rotation_divisions: Some(2),
+                color: None,
+                logical_part_count: Some(1),
+                manual_cluster_macro: None,
+                manual_cluster_children: None,
+                two_sided: None,
+                has_circular_arc: None,
+            }
+        };
+
+        // Interleave parts of Pn 01 and Pn 02 with varied sizes so global area sort would mix them across sheets
+        let parts = vec![
+            make_rect("101", 1180.0, 580.0, "Pn 01"),
+            make_rect("201", 1170.0, 580.0, "Pn 02"),
+            make_rect("102", 1160.0, 580.0, "Pn 01"),
+            make_rect("202", 1150.0, 580.0, "Pn 02"),
+            make_rect("103", 1140.0, 580.0, "Pn 01"),
+            make_rect("203", 1130.0, 580.0, "Pn 02"),
+        ];
+
+        let config = ConfigurationInput {
+            board_width: Some(2440.0),
+            board_height: Some(1220.0),
+            edge_margin: Some(10.0),
+            cut_gap: Some(6.0),
+            part_spacing: Some(6.0),
+            rotation_divisions: Some(2),
+            rotate_step: Some(180.0),
+            compact_directions: Some(vec!["left".to_string(), "bottom".to_string()]),
+            target_sheet_utilization: Some(90.0),
+            sheet_in_sheet: Some(false),
+            selective_repack: Some(false),
+            small_part_threshold: Some(0.0),
+            small_part_clearance: Some(0.0),
+            small_part_edge_zone: Some(0.0),
+            merge_cut_paths: Some(false),
+            optimization_seed: None,
+        };
+
+        let mat_state = MaterialStateInput {
+            key: Some("mdf|17.5".to_string()),
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: Some(0),
+            configuration: Some(config),
+            original_part_count: Some(parts.len()),
+            parts,
+            learning_key: None,
+            optimization_seed: None,
+        };
+
+        let layout = optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});
+        assert_eq!(layout.sheets.len(), 2, "Total sheets must stay at 2");
+        let (_score, splits, _span) = crate::scoring::compute_room_dispersion(&layout);
+        assert_eq!(splits, 0, "Each room (Pn 01 and Pn 02) should be grouped onto its own sheet with 0 splits");
+        for sheet in &layout.sheets {
+            let rooms: std::collections::BTreeSet<String> = sheet.placements.iter().map(get_placement_room_key).collect();
+            assert_eq!(rooms.len(), 1, "Sheet {} should contain exactly 1 room, got {:?}", sheet.index, rooms);
         }
     }
 }

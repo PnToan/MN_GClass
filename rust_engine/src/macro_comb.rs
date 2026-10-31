@@ -2088,11 +2088,12 @@ pub fn pair_comb_parts(
             let parallel_nest = find_parallel_nesting_vector(&poly_first, spacing, max_bw, max_bh);
 
             if let Some((dx, dy, _ratio)) = parallel_nest {
-                let mut grain_groups: BTreeMap<(i64, bool), Vec<usize>> = BTreeMap::new();
+                let mut grain_groups: BTreeMap<(i64, bool, String), Vec<usize>> = BTreeMap::new();
                 for &idx in indices.iter() {
                     let r = parts[idx].base_rotation_degrees.or(parts[idx].rotation_degrees).unwrap_or(0.0).round() as i64 % 360;
                     let ts = parts[idx].two_sided == Some(true);
-                    grain_groups.entry((r, ts)).or_default().push(idx);
+                    let rm = crate::types::get_part_room_key(&parts[idx]);
+                    grain_groups.entry((r, ts, rm)).or_default().push(idx);
                 }
 
                 for (_key, g_indices) in grain_groups.iter() {
@@ -2178,7 +2179,11 @@ pub fn pair_comb_parts(
                     while i + 1 < max_pair_idx {
                         let idx_a = indices[i];
                         let idx_b = indices[i + 1];
-                        if !is_pair_grain_compatible(idx_a, idx_b, &offsets) {
+                        let rm_a = crate::types::get_part_room_key(&parts[idx_a]);
+                        let rm_b = crate::types::get_part_room_key(&parts[idx_b]);
+                        if (!rm_a.is_empty() && !rm_b.is_empty() && rm_a != rm_b)
+                            || !is_pair_grain_compatible(idx_a, idx_b, &offsets)
+                        {
                             i += 1;
                             continue;
                         }
@@ -2217,7 +2222,12 @@ pub fn pair_comb_parts(
             let box_a = p_a.bounding_box().area();
             for ib in (ia + 1)..unpaired_cands.len() {
                 let idx_b = unpaired_cands[ib];
-                if used[idx_b] || parts[idx_a].two_sided != parts[idx_b].two_sided {
+                let rm_a = crate::types::get_part_room_key(&parts[idx_a]);
+                let rm_b = crate::types::get_part_room_key(&parts[idx_b]);
+                if used[idx_b]
+                    || parts[idx_a].two_sided != parts[idx_b].two_sided
+                    || (!rm_a.is_empty() && !rm_b.is_empty() && rm_a != rm_b)
+                {
                     continue;
                 }
                 if let Some(offsets) = get_mating(idx_a, idx_b, &mut mating_cache) {

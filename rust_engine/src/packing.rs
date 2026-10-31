@@ -546,6 +546,24 @@ where
     } else {
         Vec::new()
     };
+    let base_room_order: Vec<String> = if is_room_strategy {
+        let mut r_areas: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for (idx, r) in part_rooms.iter().enumerate() {
+            if !r.is_empty() {
+                *r_areas.entry(r.clone()).or_insert(0) += ordered_parts[idx].area.round() as i64;
+            }
+        }
+        let mut r_vec: Vec<(String, i64)> = r_areas.into_iter().collect();
+        match strategy_id % 10 {
+            1 => r_vec.sort_by(|a, b| a.0.cmp(&b.0)),
+            3 => r_vec.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))),
+            _ => r_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
+        }
+        r_vec.into_iter().map(|(k, _)| k).collect()
+    } else {
+        Vec::new()
+    };
+    let mut started_rooms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     if !is_room_strategy && ordered_parts.len() >= 120 {
         let filler_start = ordered_parts.partition_point(|p| !p.size_group.is_filler());
@@ -799,37 +817,83 @@ where
         let mut pass_count = 0;
 
         if is_room_strategy {
-            let mut active_sheet_room = String::new();
-            for i in 0..total_parts {
-                if !placed_flags[i] && !part_rooms[i].is_empty() {
-                    active_sheet_room = part_rooms[i].clone();
-                    break;
+            let mut sheet_room_queue: Vec<String> = Vec::with_capacity(base_room_order.len() + 1);
+            for r in &base_room_order {
+                if started_rooms.contains(r) && (0..total_parts).any(|i| !placed_flags[i] && &part_rooms[i] == r) {
+                    sheet_room_queue.push(r.clone());
                 }
             }
-            if !active_sheet_room.is_empty() {
-                for i in 0..total_parts {
-                    if placed_flags[i] || part_rooms[i] != active_sheet_room { continue; }
-                    let part = &ordered_parts[i];
-                    if failed_sheet_keys.contains(&part.shape_key) { continue; }
-                    if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys, false) {
-                        placed_flags[i] = true;
-                        placed_any_on_this_sheet = true;
-                        if !part.variants[0].norm_holes.is_empty() {
-                            failed_sheet_keys.clear();
-                            failed_hole_keys.clear();
-                            for j in 0..total_parts {
-                                if placed_flags[j] || part_rooms[j] != active_sheet_room { continue; }
-                                let cand = &ordered_parts[j];
-                                if !cand.variants[0].norm_holes.is_empty() || failed_hole_keys.contains(&cand.shape_key) { continue; }
-                                if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements, false) {
-                                    placed_flags[j] = true;
-                                } else {
-                                    failed_hole_keys.insert(cand.shape_key);
+            for r in &base_room_order {
+                if !started_rooms.contains(r) && (0..total_parts).any(|i| !placed_flags[i] && &part_rooms[i] == r) {
+                    sheet_room_queue.push(r.clone());
+                }
+            }
+            if (0..total_parts).any(|i| !placed_flags[i] && part_rooms[i].is_empty()) {
+                sheet_room_queue.push(String::new());
+            }
+
+            for active_sheet_room in sheet_room_queue {
+                let mut room_pass = 0;
+                loop {
+                    room_pass += 1;
+                    let mut placed_in_room_pass = false;
+                    let mut holes_added_in_room_pass = false;
+
+                    if sheets[current_sheet_idx].has_holes_or_pockets() {
+                        for i in 0..total_parts {
+                            if placed_flags[i] || part_rooms[i] != active_sheet_room { continue; }
+                            let part = &ordered_parts[i];
+                            if failed_hole_keys.contains(&part.shape_key) { continue; }
+                            if try_place_in_single_sheet_holes(part, current_sheet_idx, &mut sheets, &mut sheet_placements, false) {
+                                placed_flags[i] = true;
+                                placed_in_room_pass = true;
+                                placed_any_on_this_sheet = true;
+                                if !active_sheet_room.is_empty() {
+                                    started_rooms.insert(active_sheet_room.clone());
                                 }
+                                if !part.variants[0].norm_holes.is_empty() {
+                                    failed_hole_keys.clear();
+                                    holes_added_in_room_pass = true;
+                                }
+                            } else {
+                                failed_hole_keys.insert(part.shape_key);
                             }
                         }
-                    } else {
-                        failed_sheet_keys.insert(part.shape_key);
+                    }
+
+                    for i in 0..total_parts {
+                        if placed_flags[i] || part_rooms[i] != active_sheet_room { continue; }
+                        let part = &ordered_parts[i];
+                        if failed_sheet_keys.contains(&part.shape_key) { continue; }
+                        if try_place_on_single_sheet(part, current_sheet_idx, &mut sheets, &mut sheet_placements, &mut failed_hole_keys, false) {
+                            placed_flags[i] = true;
+                            placed_in_room_pass = true;
+                            placed_any_on_this_sheet = true;
+                            if !active_sheet_room.is_empty() {
+                                started_rooms.insert(active_sheet_room.clone());
+                            }
+                            if !part.variants[0].norm_holes.is_empty() {
+                                failed_sheet_keys.clear();
+                                failed_hole_keys.clear();
+                                holes_added_in_room_pass = true;
+                                for j in 0..total_parts {
+                                    if placed_flags[j] || part_rooms[j] != active_sheet_room { continue; }
+                                    let cand = &ordered_parts[j];
+                                    if !cand.variants[0].norm_holes.is_empty() || failed_hole_keys.contains(&cand.shape_key) { continue; }
+                                    if try_place_in_single_sheet_holes(cand, current_sheet_idx, &mut sheets, &mut sheet_placements, false) {
+                                        placed_flags[j] = true;
+                                    } else {
+                                        failed_hole_keys.insert(cand.shape_key);
+                                    }
+                                }
+                            }
+                        } else {
+                            failed_sheet_keys.insert(part.shape_key);
+                        }
+                    }
+
+                    if !placed_in_room_pass || !holes_added_in_room_pass || room_pass >= 2 {
+                        break;
                     }
                 }
                 failed_sheet_keys.clear();
