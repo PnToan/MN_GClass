@@ -396,15 +396,19 @@ where
     // 4. Irregular Shapes
     // 5. Size Group (Group 1 > Group 2 > Group 3 > Group 4)
     // 6. Area descending (-area)
-    let bl_weight = match (strategy_id * 7 + 1) % 8 {
-        0 => 1.0,
-        1 => 0.1,
-        2 => 3.0,
-        3 => 0.5,
-        4 => 2.0,
-        5 => 0.05,
-        6 => 1.5,
-        _ => 0.8,
+    let bl_weight = if strategy_id % 10 == 7 || strategy_id % 10 == 9 {
+        5.5
+    } else {
+        match (strategy_id * 7 + 1) % 8 {
+            0 => 1.0,
+            1 => 0.1,
+            2 => 5.5,
+            3 => 0.5,
+            4 => 2.0,
+            5 => 0.05,
+            6 => 1.5,
+            _ => 0.8,
+        }
     };
 
     let opt_seed = config.optimization_seed
@@ -530,12 +534,18 @@ where
         _ => {
             ordered_parts.sort_by(|a, b| {
                 if a.is_two_sided != b.is_two_sided { return b.is_two_sided.cmp(&a.is_two_sided); }
-                if a.size_group.is_filler() != b.size_group.is_filler() { return a.size_group.is_filler().cmp(&b.size_group.is_filler()); }
                 let a_cluster = a.original.manual_cluster_macro == Some(true);
                 let b_cluster = b.original.manual_cluster_macro == Some(true);
                 if a_cluster != b_cluster { return b_cluster.cmp(&a_cluster); }
-                if a.is_irregular != b.is_irregular { return b.is_irregular.cmp(&a.is_irregular); }
-                b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
+                let min_a = a.variants[0].bbox.width().min(a.variants[0].bbox.height());
+                let min_b = b.variants[0].bbox.width().min(b.variants[0].bbox.height());
+                let max_a = a.variants[0].bbox.width().max(a.variants[0].bbox.height());
+                let max_b = b.variants[0].bbox.width().max(b.variants[0].bbox.height());
+                let band_a = (min_a / 20.0).round() as i64;
+                let band_b = (min_b / 20.0).round() as i64;
+                max_b.partial_cmp(&max_a).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| band_b.cmp(&band_a))
+                    .then_with(|| b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal))
             });
         }
     }

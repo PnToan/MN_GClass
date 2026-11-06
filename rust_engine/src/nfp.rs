@@ -458,11 +458,24 @@ impl SheetContext {
                 })
         });
 
-        // Directional scoring function (Strict Bottom-Left sorting)
+        // Directional scoring function (Strategy-Aware Column/Row & Flush-Edge Alignment)
         let score_fn = |p: &Point| -> f64 {
             let dx = if pull_right { bounds.max_x - p.x - pw } else { p.x - bounds.min_x };
             let dy = if pull_top { bounds.max_y - p.y - ph } else { p.y - bounds.min_y };
-            dy * 2.0 + dx * strategy_bl_weight + ph * 0.15
+            let base = if strategy_bl_weight >= 4.0 {
+                (dx + pw) * strategy_bl_weight + dy * 0.04 + pw * 2.5
+            } else {
+                dy * 2.0 + dx * strategy_bl_weight + ph * 0.15
+            };
+            if is_rect && !self.placed.is_empty() {
+                let rx = p.x + pw;
+                let ty = p.y + ph;
+                let flush_x = (rx - bounds.max_x).abs() <= 1.0 || self.placed.iter().any(|s| ((s.x + s.width) - rx).abs() <= 1.0);
+                let flush_y = (ty - bounds.max_y).abs() <= 1.0 || self.placed.iter().any(|s| ((s.y + s.height) - ty).abs() <= 1.0);
+                base - (if flush_x { 14.0 } else { 0.0 }) - (if flush_y { 14.0 } else { 0.0 })
+            } else {
+                base
+            }
         };
 
         candidate_points.sort_by(|a, b| {

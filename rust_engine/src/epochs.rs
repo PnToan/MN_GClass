@@ -75,7 +75,13 @@ pub fn consolidate_sheets(
             changed = true;
         } else {
             let mut remaining_placements = Vec::new();
-            let src_placements = std::mem::take(&mut layout.sheets[src_idx].placements);
+            let mut src_placements = std::mem::take(&mut layout.sheets[src_idx].placements);
+            src_placements.sort_by(|a, b| {
+                let max_a = a.packed_width.max(a.packed_height);
+                let max_b = b.packed_width.max(b.packed_height);
+                max_b.partial_cmp(&max_a).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal))
+            });
             let mut failed_target_keys: Vec<std::collections::HashSet<u64>> = vec![std::collections::HashSet::new(); src_idx];
 
             // Try moving each placement from src_sheet to an earlier sheet (0..src_idx)
@@ -237,6 +243,217 @@ pub fn consolidate_sheets(
 
                 if !moved {
                     remaining_placements.push(p);
+                }
+            }
+
+            if !remaining_placements.is_empty() && layout.sheets.len() <= 6 && remaining_placements.len() <= 20 {
+                let rem_area: f64 = remaining_placements.iter().map(|p| p.area).sum();
+                let rem_has_2s = remaining_placements.iter().any(|p| p.two_sided == Some(true));
+                let usable_area = (board_w - 2.0 * margin).max(1.0) * (board_h - 2.0 * margin).max(1.0);
+                for target_idx in (src_idx.saturating_sub(2)..src_idx).rev() {
+                    if sheet_used_area[target_idx] + rem_area > usable_area * 0.94 {
+                        continue;
+                    }
+                    let tgt_has_2s = layout.sheets[target_idx].placements.iter().any(|p| p.two_sided == Some(true));
+                    if rem_has_2s && !tgt_has_2s {
+                        continue;
+                    }
+                    let total_cnt = layout.sheets[target_idx].placements.len() + remaining_placements.len();
+                    if total_cnt > 50 {
+                        continue;
+                    }
+                    let base_pool: Vec<crate::types::PlacementOutput> = layout.sheets[target_idx]
+                        .placements
+                        .iter()
+                        .chain(remaining_placements.iter())
+                        .cloned()
+                        .collect();
+
+                    let mut absorbed_all = None;
+                    for &(mode_id, mode_bl) in &[(0usize, 5.5f64), (1, 0.2), (2, 5.5), (3, 1.0)] {
+                        let mut pool = base_pool.clone();
+                        pool.sort_by(|a, b| {
+                            let a_2s = a.two_sided == Some(true);
+                            let b_2s = b.two_sided == Some(true);
+                            if a_2s != b_2s {
+                                return b_2s.cmp(&a_2s);
+                            }
+                            let max_a = a.packed_width.max(a.packed_height);
+                            let max_b = b.packed_width.max(b.packed_height);
+                            let min_a = a.packed_width.min(a.packed_height);
+                            let min_b = b.packed_width.min(b.packed_height);
+                            match mode_id {
+                                0 | 1 => max_b
+                                    .partial_cmp(&max_a)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)),
+                                2 => {
+                                    let band_a = (min_a / 20.0).round() as i64;
+                                    let band_b = (min_b / 20.0).round() as i64;
+                                    band_b
+                                        .cmp(&band_a)
+                                        .then_with(|| max_b.partial_cmp(&max_a).unwrap_or(std::cmp::Ordering::Equal))
+                                }
+                                _ => b
+                                    .area
+                                    .partial_cmp(&a.area)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| max_b.partial_cmp(&max_a).unwrap_or(std::cmp::Ordering::Equal)),
+                            }
+                        });
+
+                        let mut trial_ctx = SheetContext::new(
+                            board_w,
+                            board_h,
+                            margin,
+                            spacing,
+                            small_part_edge_zone,
+                            merge_cut_paths,
+                            sheet_in_sheet,
+                            compact_directions.to_vec(),
+                        );
+                        let mut trial_placed = Vec::with_capacity(pool.len());
+                        let mut all_ok = true;
+
+                        for p in pool.into_iter() {
+                            let poly = Polygon::from_raw(&p.contour);
+                            let curr_rot = p.rotation_degrees;
+                            let has_direct_grain = p.has_grain_label == Some(true)
+                                || p.grain_locked == Some(true)
+                                || p.grain_arrow_degrees.is_some();
+                            let is_free = p.free_rotation == Some(true) || global_rot_div >= 4;
+                            let is_grain = if is_free {
+                                false
+                            } else {
+                                (global_rot_div <= 2) || has_direct_grain || (p.manual_cluster_macro == Some(true))
+                            };
+                            let allowed_rotations = if is_grain {
+                                if global_rot_div == 1 && !has_direct_grain { vec![0.0] } else { vec![0.0, 180.0] }
+                            } else if poly.is_rectangular() && p.holes.as_ref().map_or(true, |h| h.is_empty()) {
+                                vec![0.0, 90.0]
+                            } else {
+                                vec![0.0, 90.0, 180.0, 270.0]
+                            };
+
+                            let mut best_cand: Option<(f64, f64, f64, f64, f64, f64, Polygon, Vec<Polygon>)> = None;
+                            for &delta_rot in &allowed_rotations {
+                                let new_rot = norm_angle(curr_rot + delta_rot);
+                                if is_grain {
+                                    let base_rot = norm_angle(p.base_rotation_degrees.unwrap_or(0.0));
+                                    let diff = (new_rot - base_rot).abs() % 180.0;
+                                    if diff > 2.0 && diff < 178.0 {
+                                        continue;
+                                    }
+                                }
+                                let rotated = poly.rotate_degrees(delta_rot, Point::new(0.0, 0.0));
+                                let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
+                                let norm_holes: Vec<Polygon> = p.holes.as_ref().map_or(Vec::new(), |raw_holes| {
+                                    raw_holes.iter().map(|raw| {
+                                        Polygon::from_raw(raw)
+                                            .rotate_degrees(delta_rot, Point::new(0.0, 0.0))
+                                            .translate(shift_x, shift_y)
+                                    }).collect()
+                                });
+                                let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
+                                let dilated_poly = crate::geometry::offset_polygon(&norm_poly, spacing * 0.5);
+                                let dilated_bbox = dilated_poly.bounding_box();
+                                if let Some((px, py, sc)) = trial_ctx.find_best_anchor(
+                                    &norm_poly,
+                                    &dilated_poly,
+                                    &dilated_bbox,
+                                    is_rect,
+                                    p.small_part.unwrap_or(false),
+                                    p.small_part_clearance.unwrap_or(0.0),
+                                    mode_bl,
+                                ) {
+                                    if best_cand.as_ref().map_or(true, |c| sc < c.0) {
+                                        best_cand = Some((sc, px, py, delta_rot, shift_x, shift_y, norm_poly, norm_holes));
+                                    }
+                                }
+                            }
+
+                            if let Some((_, px, py, delta_rot, shift_x, shift_y, norm_poly, norm_holes)) = best_cand {
+                                let new_rot = norm_angle(curr_rot + delta_rot);
+                                let bbox = norm_poly.bounding_box();
+                                trial_ctx.add_placed(
+                                    norm_poly.clone(),
+                                    norm_holes.clone(),
+                                    px,
+                                    py,
+                                    new_rot,
+                                    p.small_part.unwrap_or(false),
+                                    p.small_part_clearance.unwrap_or(0.0),
+                                );
+                                let mut new_p = p.clone();
+                                new_p.x = px;
+                                new_p.y = py;
+                                new_p.rotation_degrees = new_rot;
+                                new_p.packed_width = bbox.width();
+                                new_p.packed_height = bbox.height();
+                                new_p.contour = norm_poly.to_raw();
+                                new_p.holes = if norm_holes.is_empty() {
+                                    None
+                                } else {
+                                    Some(norm_holes.iter().map(|h| h.to_raw()).collect())
+                                };
+                                new_p.small_part_edge_protected = Some(trial_ctx.small_part_edge_protected(
+                                    p.small_part.unwrap_or(false),
+                                    px,
+                                    py,
+                                    bbox.width(),
+                                    bbox.height(),
+                                ));
+                                if delta_rot.abs() > 1e-4 {
+                                    new_p.draw_layers = p.draw_layers.as_ref().map(|layers| {
+                                        let rad = delta_rot * std::f64::consts::PI / 180.0;
+                                        layers.iter().map(|layer| {
+                                            let norm_paths = layer.paths.as_ref().map(|paths| {
+                                                paths.iter().map(|path| {
+                                                    let rot_pts = path.points.iter().map(|pt_raw| {
+                                                        let pt = Point::new(pt_raw[0], pt_raw[1]).rotate(rad, Point::new(0.0, 0.0));
+                                                        [(pt.x + shift_x).round(), (pt.y + shift_y).round()]
+                                                    }).collect();
+                                                    crate::types::DrawPathData {
+                                                        points: rot_pts,
+                                                        closed: path.closed,
+                                                        surface_face: path.surface_face,
+                                                        surface_face_id: path.surface_face_id.clone(),
+                                                        surface_loop_type: path.surface_loop_type.clone(),
+                                                        geometry_kind: path.geometry_kind.clone(),
+                                                        _nesting_packed_local: Some(true),
+                                                    }
+                                                }).collect()
+                                            });
+                                            crate::types::DrawLayerData {
+                                                name: layer.name.clone(),
+                                                layer_name: layer.layer_name.clone(),
+                                                color: layer.color.clone(),
+                                                side: layer.side.clone(),
+                                                r#type: layer.r#type.clone(),
+                                                paths: norm_paths,
+                                            }
+                                        }).collect()
+                                    });
+                                }
+                                trial_placed.push(new_p);
+                            } else {
+                                all_ok = false;
+                                break;
+                            }
+                        }
+
+                        if all_ok {
+                            absorbed_all = Some(trial_placed);
+                            break;
+                        }
+                    }
+
+                    if let Some(merged_placements) = absorbed_all {
+                        layout.sheets[target_idx].placements = merged_placements;
+                        remaining_placements.clear();
+                        changed = true;
+                        break;
+                    }
                 }
             }
 
@@ -819,7 +1036,7 @@ fn try_room_subbatched_layout_fast(
         }
     }
 
-    if start_mat.elapsed().as_secs_f64() < 9.5 {
+    if start_mat.elapsed().as_secs_f64() < 4.5 && baseline_sheets <= 8 {
         let aff_layout = pack_sub_state_parallel(
             paired_material_state,
             &[100, 101, 102, 103],
@@ -914,15 +1131,15 @@ where
     let is_selective = config_obj.selective_repack == Some(true);
     let num_strategies = if is_selective {
         (num_threads * 2).clamp(16, 32)
-    } else if baseline_elapsed > 4.0 {
+    } else if baseline_elapsed > 3.5 || best_layout.sheets.len() >= 14 {
         2.min(num_threads)
-    } else if best_layout.sheets.len() <= 1 && !has_complex_shapes && !has_multi_rooms {
+    } else if best_layout.sheets.len() >= 8 || total_parts > 120 || (best_layout.sheets.len() <= 1 && !has_complex_shapes && !has_multi_rooms) {
         4.min(num_threads)
     } else {
-        num_threads.clamp(6, 16)
+        num_threads.clamp(6, 12)
     };
 
-    if num_strategies > 0 && baseline_elapsed < 8.0 {
+    if num_strategies > 0 && baseline_elapsed < 6.0 {
         let (tx, rx) = std::sync::mpsc::channel();
         (1..=num_strategies).into_par_iter().for_each_with(tx, |s, idx| {
             let strategy_id = if has_multi_rooms && num_strategies >= 4 && idx == num_strategies - 2 {
@@ -935,12 +1152,14 @@ where
                 idx
             };
             let mut layout = crate::packing::pack_material_with_prepared(&paired_material_state, &prepared_parts, comb_count, strategy_id);
-            consolidate_sheets(&mut layout, global_rot_div, sheet_in_sheet, &compact_directions);
+            if layout.sheets.len() <= 10 {
+                consolidate_sheets(&mut layout, global_rot_div, sheet_in_sheet, &compact_directions);
+            }
             let _ = s.send((strategy_id, layout));
         });
 
         let mut completed_count = 0;
-        let phase2_budget = if has_multi_rooms { 7.8 } else { 9.5 };
+        let phase2_budget = if best_layout.sheets.len() >= 10 { 3.8 } else if has_multi_rooms { 5.2 } else { 6.0 };
         while let Ok((_strat_id, mut layout)) = rx.recv() {
             completed_count += 1;
             prioritize_two_sided_sheets(&mut layout.sheets);
