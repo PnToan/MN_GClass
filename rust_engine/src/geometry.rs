@@ -105,16 +105,24 @@ pub struct Polygon {
 }
 
 impl Polygon {
-    pub fn from_raw(raw: &[[f64; 2]]) -> Self {
-        let points = raw.iter().map(|p| Point::new(p[0], p[1])).collect();
+    pub fn new(points: Vec<Point>) -> Self {
         Polygon { points }
+    }
+
+    pub fn from_raw(raw: &[[f64; 2]]) -> Self {
+        let pts: Vec<Point> = raw.iter().map(|p| Point::new(p[0], p[1])).collect();
+        Polygon { points: pts }
     }
 
     pub fn to_raw(&self) -> Vec<[f64; 2]> {
         self.points.iter().map(|p| [p.x, p.y]).collect()
     }
 
-    pub fn area(&self) -> f64 {
+    pub fn bounding_box(&self) -> Rect {
+        Rect::from_points(&self.points)
+    }
+
+    pub fn signed_area(&self) -> f64 {
         let n = self.points.len();
         if n < 3 {
             return 0.0;
@@ -125,11 +133,63 @@ impl Polygon {
             area += self.points[i].x * self.points[j].y;
             area -= self.points[j].x * self.points[i].y;
         }
-        area.abs() * 0.5
+        area * 0.5
     }
 
-    pub fn bounding_box(&self) -> Rect {
-        Rect::from_points(&self.points)
+    #[inline]
+    pub fn area(&self) -> f64 {
+        self.signed_area().abs()
+    }
+
+    pub fn perimeter(&self) -> f64 {
+        let n = self.points.len();
+        if n < 2 { return 0.0; }
+        let mut p = 0.0;
+        for i in 0..n {
+            let p1 = self.points[i];
+            let p2 = self.points[(i + 1) % n];
+            p += ((p2.x - p1.x).powi(2) + (p2.y - p1.y).powi(2)).sqrt();
+        }
+        p
+    }
+
+    pub fn is_rectangular(&self) -> bool {
+        let clean = if self.points.len() > 4 {
+            simplify_collinear(&self.points, 0.5)
+        } else {
+            self.points.clone()
+        };
+        if clean.len() != 4 {
+            return false;
+        }
+        let clean_poly = Polygon::new(clean);
+        let bbox = clean_poly.bounding_box();
+        let bbox_area = bbox.area();
+        let poly_area = clean_poly.area();
+        if bbox_area <= 0.0 {
+            return false;
+        }
+        (bbox_area - poly_area).abs() / bbox_area < 0.01
+    }
+
+    pub fn is_circular(&self) -> bool {
+        let n = self.points.len();
+        if n < 8 { return false; }
+        let bbox = self.bounding_box();
+        let w = bbox.width();
+        let h = bbox.height();
+        if w <= 0.0 || (w - h).abs() / w.max(h) > 0.08 {
+            return false;
+        }
+        let perim = self.perimeter();
+        if perim <= 0.0 { return false; }
+        let circularity = (4.0 * PI * self.area()) / (perim * perim);
+        circularity >= 0.82
+    }
+
+    pub fn circle_radius(&self) -> f64 {
+        let bbox = self.bounding_box();
+        (bbox.width() + bbox.height()) * 0.25
     }
 
     pub fn centroid(&self) -> Point {
@@ -139,23 +199,21 @@ impl Polygon {
         }
         let mut cx = 0.0;
         let mut cy = 0.0;
-        let mut signed_area = 0.0;
+        let area = self.signed_area();
+        if area.abs() < 1e-9 {
+            for p in &self.points {
+                cx += p.x;
+                cy += p.y;
+            }
+            return Point::new(cx / n as f64, cy / n as f64);
+        }
         for i in 0..n {
             let j = (i + 1) % n;
-            let a = self.points[i].x * self.points[j].y - self.points[j].x * self.points[i].y;
-            signed_area += a;
-            cx += (self.points[i].x + self.points[j].x) * a;
-            cy += (self.points[i].y + self.points[j].y) * a;
+            let factor = self.points[i].x * self.points[j].y - self.points[j].x * self.points[i].y;
+            cx += (self.points[i].x + self.points[j].x) * factor;
+            cy += (self.points[i].y + self.points[j].y) * factor;
         }
-        signed_area *= 0.5;
-        if signed_area.abs() < 1e-6 {
-            let sum_x: f64 = self.points.iter().map(|p| p.x).sum();
-            let sum_y: f64 = self.points.iter().map(|p| p.y).sum();
-            return Point::new(sum_x / n as f64, sum_y / n as f64);
-        }
-        cx /= 6.0 * signed_area;
-        cy /= 6.0 * signed_area;
-        Point::new(cx, cy)
+        Point::new(cx / (6.0 * area), cy / (6.0 * area))
     }
 
     pub fn translate(&self, dx: f64, dy: f64) -> Polygon {
@@ -164,283 +222,207 @@ impl Polygon {
         }
     }
 
-    pub fn normalize_to_origin(&self) -> Polygon {
-        let bbox = self.bounding_box();
-        self.translate(-bbox.min_x, -bbox.min_y)
-    }
-
-    pub fn rotate_deg(&self, deg: f64) -> Polygon {
-        let rad = deg * PI / 180.0;
-        let origin = Point::new(0.0, 0.0);
-        let rotated_points: Vec<Point> = self.points.iter().map(|p| p.rotate(rad, origin)).collect();
-        let rotated = Polygon { points: rotated_points };
-        rotated.normalize_to_origin()
-    }
-
-    pub fn is_rectangular(&self) -> bool {
-        let bbox = self.bounding_box();
-        let area = self.area();
-        let bbox_area = bbox.area();
-        if bbox_area < 1e-4 {
-            return false;
+    pub fn rotate_degrees(&self, degrees: f64, center: Point) -> Polygon {
+        if degrees.abs() < 1e-6 {
+            return self.clone();
         }
-        (area - bbox_area).abs() / bbox_area < 0.005
-    }
-
-    pub fn is_circular(&self) -> bool {
-        if self.points.len() < 8 {
-            return false;
+        let rad = degrees * PI / 180.0;
+        Polygon {
+            points: self.points.iter().map(|p| p.rotate(rad, center)).collect(),
         }
-        let center = self.centroid();
-        let radii: Vec<f64> = self.points.iter().map(|p| {
-            ((p.x - center.x).powi(2) + (p.y - center.y).powi(2)).sqrt()
-        }).collect();
-        let avg_r: f64 = radii.iter().sum::<f64>() / radii.len() as f64;
-        let max_diff: f64 = radii.iter().map(|r| (r - avg_r).abs()).fold(0.0, f64::max);
-        max_diff / avg_r.max(1.0) < 0.05
     }
 
-    pub fn circle_radius(&self) -> f64 {
-        let center = self.centroid();
-        let radii: Vec<f64> = self.points.iter().map(|p| {
-            ((p.x - center.x).powi(2) + (p.y - center.y).powi(2)).sqrt()
-        }).collect();
-        radii.iter().sum::<f64>() / radii.len().max(1) as f64
+    pub fn normalize_to_origin(&self) -> (Polygon, f64, f64) {
+        let bbox = self.bounding_box();
+        let poly = self.translate(-bbox.min_x, -bbox.min_y);
+        (poly, -bbox.min_x, -bbox.min_y)
     }
 
-    pub fn contains_point(&self, pt: Point) -> bool {
-        let mut inside = false;
+    pub fn contains_point_strict(&self, p: Point, margin: f64) -> bool {
         let n = self.points.len();
         if n < 3 {
             return false;
         }
+        let bbox = self.bounding_box();
+        if p.x < bbox.min_x - 1e-4
+            || p.x > bbox.max_x + 1e-4
+            || p.y < bbox.min_y - 1e-4
+            || p.y > bbox.max_y + 1e-4
+        {
+            return false;
+        }
+        let mut inside = false;
         let mut j = n - 1;
         for i in 0..n {
             let pi = self.points[i];
             let pj = self.points[j];
-            if ((pi.y > pt.y) != (pj.y > pt.y))
-                && (pt.x < (pj.x - pi.x) * (pt.y - pi.y) / (pj.y - pi.y + 1e-12) + pi.x)
-            {
-                inside = !inside;
+            let dy = pj.y - pi.y;
+            if dy.abs() > 1e-9 && ((pi.y > p.y) != (pj.y > p.y)) {
+                let intersect_x = (pj.x - pi.x) * (p.y - pi.y) / dy + pi.x;
+                if p.x < intersect_x {
+                    inside = !inside;
+                }
             }
             j = i;
         }
-        inside
-    }
-}
-
-pub fn rotate_raw_points(points: &[[f64; 2]], rad: f64) -> Vec<[f64; 2]> {
-    let cos = rad.cos();
-    let sin = rad.sin();
-    points.iter().map(|p| {
-        let rx = (p[0] * cos - p[1] * sin) * 1000.0;
-        let ry = (p[0] * sin + p[1] * cos) * 1000.0;
-        [rx.round() / 1000.0, ry.round() / 1000.0]
-    }).collect()
-}
-
-pub fn rotate_shape_full(
-    contour: &[[f64; 2]],
-    holes: Option<&Vec<Vec<[f64; 2]>>>,
-    draw_layers: Option<&Vec<serde_json::Value>>,
-    deg: f64,
-) -> (Polygon, Option<Vec<Vec<[f64; 2]>>>, Option<Vec<serde_json::Value>>) {
-    let rad = deg * PI / 180.0;
-    let rot_contour = rotate_raw_points(contour, rad);
-    let min_x = rot_contour.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
-    let min_y = rot_contour.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
-
-    let norm_contour: Vec<[f64; 2]> = rot_contour.iter().map(|p| [
-        ((p[0] - min_x) * 1000.0).round() / 1000.0,
-        ((p[1] - min_y) * 1000.0).round() / 1000.0,
-    ]).collect();
-
-    let norm_holes = holes.map(|h_list| {
-        h_list.iter().map(|h| {
-            let rot_h = rotate_raw_points(h, rad);
-            rot_h.iter().map(|p| [
-                ((p[0] - min_x) * 1000.0).round() / 1000.0,
-                ((p[1] - min_y) * 1000.0).round() / 1000.0,
-            ]).collect()
-        }).collect()
-    });
-
-    let norm_layers = draw_layers.map(|layers| {
-        layers.iter().map(|layer| {
-            let mut layer_obj = layer.clone();
-            if let Some(paths) = layer_obj.get_mut("paths").and_then(|p| p.as_array_mut()) {
-                for path in paths.iter_mut() {
-                    if let Some(points) = path.get_mut("points").and_then(|pts| pts.as_array_mut()) {
-                        let raw_pts: Vec<[f64; 2]> = points.iter().filter_map(|pt| {
-                            if let Some(arr) = pt.as_array() {
-                                if arr.len() >= 2 {
-                                    return Some([arr[0].as_f64().unwrap_or(0.0), arr[1].as_f64().unwrap_or(0.0)]);
-                                }
-                            }
-                            None
-                        }).collect();
-
-                        let rot_pts = rotate_raw_points(&raw_pts, rad);
-                        let norm_pts: Vec<serde_json::Value> = rot_pts.iter().map(|p| {
-                            serde_json::json!([
-                                ((p[0] - min_x) * 1000.0).round() / 1000.0,
-                                ((p[1] - min_y) * 1000.0).round() / 1000.0
-                            ])
-                        }).collect();
-                        *points = norm_pts;
-                    }
+        if !inside {
+            return false;
+        }
+        if margin > 1e-6 {
+            for i in 0..n {
+                let p1 = self.points[i];
+                let p2 = self.points[(i + 1) % n];
+                let d = point_to_segment_distance(p, p1, p2);
+                if d < margin {
+                    return false;
                 }
             }
-            layer_obj
-        }).collect()
-    });
-
-    (Polygon::from_raw(&norm_contour), norm_holes, norm_layers)
-}
-
-pub fn offset_polygon(poly: &Polygon, delta: f64) -> Polygon {
-    let bbox = poly.bounding_box();
-    if poly.is_rectangular() {
-        return Polygon {
-            points: vec![
-                Point::new(bbox.min_x - delta, bbox.min_y - delta),
-                Point::new(bbox.max_x + delta, bbox.min_y - delta),
-                Point::new(bbox.max_x + delta, bbox.max_y + delta),
-                Point::new(bbox.min_x - delta, bbox.max_y + delta),
-            ],
-        };
+        }
+        true
     }
-    let n = poly.points.len();
-    if n < 3 {
-        return poly.clone();
-    }
-    let mut new_points = Vec::with_capacity(n);
-    for i in 0..n {
-        let prev = poly.points[(i + n - 1) % n];
-        let curr = poly.points[i];
-        let next = poly.points[(i + 1) % n];
-
-        let v1 = Point::new(curr.x - prev.x, curr.y - prev.y);
-        let l1 = (v1.x * v1.x + v1.y * v1.y).sqrt().max(1e-6);
-        let n1 = Point::new(-v1.y / l1, v1.x / l1);
-
-        let v2 = Point::new(next.x - curr.x, next.y - curr.y);
-        let l2 = (v2.x * v2.x + v2.y * v2.y).sqrt().max(1e-6);
-        let n2 = Point::new(-v2.y / l2, v2.x / l2);
-
-        let avg_n = Point::new((n1.x + n2.x) * 0.5, (n1.y + n2.y) * 0.5);
-        let l_avg = (avg_n.x * avg_n.x + avg_n.y * avg_n.y).sqrt().max(1e-6);
-        let scale = delta / l_avg;
-
-        new_points.push(Point::new(curr.x + avg_n.x * scale, curr.y + avg_n.y * scale));
-    }
-    Polygon { points: new_points }
 }
 
 #[inline]
-fn dist_to_segment(p: Point, a: Point, b: Point) -> f64 {
-    let l2 = (b.x - a.x).powi(2) + (b.y - a.y).powi(2);
-    if l2 < 1e-8 {
+pub fn point_to_segment_distance(p: Point, a: Point, b: Point) -> f64 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let l2 = dx * dx + dy * dy;
+    if l2 < 1e-12 {
         return ((p.x - a.x).powi(2) + (p.y - a.y).powi(2)).sqrt();
     }
-    let t = (((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2).clamp(0.0, 1.0);
-    let proj = Point::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y));
-    ((p.x - proj.x).powi(2) + (p.y - proj.y).powi(2)).sqrt()
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / l2).clamp(0.0, 1.0);
+    let proj_x = a.x + t * dx;
+    let proj_y = a.y + t * dy;
+    ((p.x - proj_x).powi(2) + (p.y - proj_y).powi(2)).sqrt()
 }
 
-fn segments_intersect(a1: Point, a2: Point, b1: Point, b2: Point) -> bool {
-    fn ccw(a: Point, b: Point, c: Point) -> bool {
-        (c.y - a.y) * (b.x - a.x) > (b.y - a.y) * (c.x - a.x)
+#[inline]
+pub fn segments_intersect_proper(p1: Point, p2: Point, p3: Point, p4: Point) -> bool {
+    let d1 = ccw(p3, p4, p1);
+    let d2 = ccw(p3, p4, p2);
+    let d3 = ccw(p1, p2, p3);
+    let d4 = ccw(p1, p2, p4);
+
+    ((d1 > 1e-4 && d2 < -1e-4) || (d1 < -1e-4 && d2 > 1e-4))
+        && ((d3 > 1e-4 && d4 < -1e-4) || (d3 < -1e-4 && d4 > 1e-4))
+}
+
+#[inline]
+fn ccw(a: Point, b: Point, c: Point) -> f64 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+#[inline]
+pub fn segment_to_segment_distance(p1: Point, p2: Point, q1: Point, q2: Point) -> f64 {
+    if segments_intersect_proper(p1, p2, q1, q2) {
+        return 0.0;
     }
-    ccw(a1, b1, b2) != ccw(a2, b1, b2) && ccw(a1, a2, b1) != ccw(a1, a2, b2)
+    let d1 = point_to_segment_distance(p1, q1, q2);
+    let d2 = point_to_segment_distance(p2, q1, q2);
+    let d3 = point_to_segment_distance(q1, p1, p2);
+    let d4 = point_to_segment_distance(q2, p1, p2);
+    d1.min(d2).min(d3).min(d4)
 }
 
 pub fn polygons_collide_with_spacing(poly1: &Polygon, poly2: &Polygon, spacing: f64) -> bool {
     let bbox1 = poly1.bounding_box();
     let bbox2 = poly2.bounding_box();
-    if !bbox1.intersects(&bbox2.translate(-spacing * 0.5, -spacing * 0.5), spacing) {
+
+    // Fast bounding box rejection with spacing
+    if bbox1.min_x >= bbox2.max_x + spacing - 1e-4
+        || bbox1.max_x <= bbox2.min_x - spacing + 1e-4
+        || bbox1.min_y >= bbox2.max_y + spacing - 1e-4
+        || bbox1.max_y <= bbox2.min_y - spacing + 1e-4
+    {
         return false;
+    }
+
+    if poly1.is_rectangular() && poly2.is_rectangular() {
+        return true;
     }
 
     let n1 = poly1.points.len();
     let n2 = poly2.points.len();
+    if n1 < 3 || n2 < 3 {
+        return false;
+    }
 
-    // 1. Direct edge intersections
+    // 1. Check if any edge-edge distance is strictly less than spacing
     for i in 0..n1 {
         let p1 = poly1.points[i];
         let p2 = poly1.points[(i + 1) % n1];
         for j in 0..n2 {
             let q1 = poly2.points[j];
             let q2 = poly2.points[(j + 1) % n2];
-            if segments_intersect(p1, p2, q1, q2) {
-                return true;
+
+            if spacing > 1e-4 {
+                let d = segment_to_segment_distance(p1, p2, q1, q2);
+                if d < spacing - 1e-4 {
+                    return true;
+                }
+            } else {
+                if segments_intersect_proper(p1, p2, q1, q2) {
+                    return true;
+                }
             }
         }
     }
 
-    // 2. Vertex inside check
-    if poly1.contains_point(poly2.points[0]) || poly2.contains_point(poly1.points[0]) {
+    // 2. Comprehensive containment check (any vertex inside the other polygon)
+    for pt in &poly1.points {
+        if poly2.contains_point_strict(*pt, 0.0) {
+            return true;
+        }
+    }
+    for pt in &poly2.points {
+        if poly1.contains_point_strict(*pt, 0.0) {
+            return true;
+        }
+    }
+    if poly1.contains_point_strict(poly2.centroid(), 0.0)
+        || poly2.contains_point_strict(poly1.centroid(), 0.0)
+    {
         return true;
-    }
-
-    // 3. Minimum distance between edges < spacing
-    if spacing > 1e-4 {
-        for pt in &poly1.points {
-            for j in 0..n2 {
-                let q1 = poly2.points[j];
-                let q2 = poly2.points[(j + 1) % n2];
-                if dist_to_segment(*pt, q1, q2) < spacing - 1e-4 {
-                    return true;
-                }
-            }
-        }
-        for pt in &poly2.points {
-            for i in 0..n1 {
-                let p1 = poly1.points[i];
-                let p2 = poly1.points[(i + 1) % n1];
-                if dist_to_segment(*pt, p1, p2) < spacing - 1e-4 {
-                    return true;
-                }
-            }
-        }
     }
 
     false
 }
 
-pub fn polygon_contained_in_hole(inner: &Polygon, hole: &Polygon, margin: f64) -> bool {
+#[allow(dead_code)]
+#[inline]
+pub fn polygons_intersect(poly1: &Polygon, poly2: &Polygon, _tolerance: f64) -> bool {
+    polygons_collide_with_spacing(poly1, poly2, 0.0)
+}
+
+pub fn polygon_contained_in_hole(inner: &Polygon, hole: &Polygon, spacing: f64) -> bool {
     let inner_bbox = inner.bounding_box();
     let hole_bbox = hole.bounding_box();
 
-    if !hole_bbox.contains_rect(&inner_bbox, -margin) {
+    if inner_bbox.min_x < hole_bbox.min_x + spacing - 1e-4
+        || inner_bbox.max_x > hole_bbox.max_x - spacing + 1e-4
+        || inner_bbox.min_y < hole_bbox.min_y + spacing - 1e-4
+        || inner_bbox.max_y > hole_bbox.max_y - spacing + 1e-4
+    {
         return false;
     }
 
     for pt in &inner.points {
-        if !hole.contains_point(*pt) {
+        if !hole.contains_point_strict(*pt, spacing * 0.5) {
             return false;
         }
     }
 
-    let n_hole = hole.points.len();
-    for pt in &inner.points {
-        for j in 0..n_hole {
-            let q1 = hole.points[j];
-            let q2 = hole.points[(j + 1) % n_hole];
-            if dist_to_segment(*pt, q1, q2) < margin - 1e-4 {
-                return false;
-            }
-        }
-    }
-
-    let n_inner = inner.points.len();
-    for i in 0..n_inner {
+    let n1 = inner.points.len();
+    let n2 = hole.points.len();
+    for i in 0..n1 {
         let p1 = inner.points[i];
-        let p2 = inner.points[(i + 1) % n_inner];
-        for j in 0..n_hole {
+        let p2 = inner.points[(i + 1) % n1];
+        for j in 0..n2 {
             let q1 = hole.points[j];
-            let q2 = hole.points[(j + 1) % n_hole];
-            if segments_intersect(p1, p2, q1, q2) {
+            let q2 = hole.points[(j + 1) % n2];
+            let d1 = point_to_segment_distance(p1, q1, q2);
+            let d2 = point_to_segment_distance(q1, p1, p2);
+            if d1 < spacing - 1e-3 || d2 < spacing - 1e-3 {
                 return false;
             }
         }
@@ -448,3 +430,477 @@ pub fn polygon_contained_in_hole(inner: &Polygon, hole: &Polygon, margin: f64) -
 
     true
 }
+
+pub fn offset_polygon(poly: &Polygon, padding: f64) -> Polygon {
+    if padding.abs() < 1e-6 || poly.points.len() < 3 {
+        return poly.clone();
+    }
+
+    if poly.is_rectangular() {
+        let bbox = poly.bounding_box();
+        return Polygon::new(vec![
+            Point::new(bbox.min_x - padding, bbox.min_y - padding),
+            Point::new(bbox.max_x + padding, bbox.min_y - padding),
+            Point::new(bbox.max_x + padding, bbox.max_y + padding),
+            Point::new(bbox.min_x - padding, bbox.max_y + padding),
+        ]);
+    }
+
+    let n = poly.points.len();
+    let mut new_points = Vec::with_capacity(n);
+    let is_ccw = poly.signed_area() > 0.0;
+
+    for i in 0..n {
+        let prev = poly.points[(i + n - 1) % n];
+        let curr = poly.points[i];
+        let next = poly.points[(i + 1) % n];
+
+        let v1_x = curr.x - prev.x;
+        let v1_y = curr.y - prev.y;
+        let len1 = (v1_x * v1_x + v1_y * v1_y).sqrt().max(1e-9);
+        let n1_x = if is_ccw { v1_y / len1 } else { -v1_y / len1 };
+        let n1_y = if is_ccw { -v1_x / len1 } else { v1_x / len1 };
+
+        let v2_x = next.x - curr.x;
+        let v2_y = next.y - curr.y;
+        let len2 = (v2_x * v2_x + v2_y * v2_y).sqrt().max(1e-9);
+        let n2_x = if is_ccw { v2_y / len2 } else { -v2_y / len2 };
+        let n2_y = if is_ccw { -v2_x / len2 } else { v2_x / len2 };
+
+        let bisector_x = n1_x + n2_x;
+        let bisector_y = n1_y + n2_y;
+        let b_len = (bisector_x * bisector_x + bisector_y * bisector_y).sqrt().max(1e-9);
+        let cos_half = ((n1_x * n2_x + n1_y * n2_y + 1.0) / 2.0).max(0.1).sqrt();
+        let miter_dist = (padding / cos_half).min(padding * 2.5);
+
+        let off_x = curr.x + (bisector_x / b_len) * miter_dist;
+        let off_y = curr.y + (bisector_y / b_len) * miter_dist;
+        new_points.push(Point::new(off_x, off_y));
+    }
+
+    Polygon::new(new_points)
+}
+
+pub fn simplify_collinear(points: &[Point], tolerance: f64) -> Vec<Point> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let mut clean: Vec<Point> = Vec::with_capacity(points.len());
+    for &p in points {
+        if let Some(&last) = clean.last() {
+            let dx = p.x - last.x;
+            let dy = p.y - last.y;
+            if (dx * dx + dy * dy).sqrt() > 1e-4 {
+                clean.push(p);
+            }
+        } else {
+            clean.push(p);
+        }
+    }
+    if clean.len() >= 2 {
+        let first = clean[0];
+        let last = *clean.last().unwrap();
+        let dx = first.x - last.x;
+        let dy = first.y - last.y;
+        if (dx * dx + dy * dy).sqrt() <= 1e-4 {
+            clean.pop();
+        }
+    }
+    if clean.len() < 3 {
+        return points.to_vec();
+    }
+
+    let n = clean.len();
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = clean[(i + n - 1) % n];
+        let curr = clean[i];
+        let next = clean[(i + 1) % n];
+
+        let d = point_to_segment_distance(curr, prev, next);
+        if d >= tolerance {
+            result.push(curr);
+        }
+    }
+    if result.len() < 3 {
+        clean
+    } else {
+        result
+    }
+}
+
+pub fn ensure_ccw(poly: &Polygon) -> Polygon {
+    if poly.signed_area() < 0.0 {
+        let mut rev = poly.points.clone();
+        rev.reverse();
+        Polygon::new(rev)
+    } else {
+        poly.clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Edge {
+    pub p1: Point,
+    pub p2: Point,
+    pub length: f64,
+    pub angle: f64,
+    pub index: usize,
+}
+
+impl Edge {
+    pub fn new(p1: Point, p2: Point, index: usize) -> Self {
+        let dx = p2.x - p1.x;
+        let dy = p2.y - p1.y;
+        let length = (dx * dx + dy * dy).sqrt();
+        let angle = dy.atan2(dx);
+        Edge { p1, p2, length, angle, index }
+    }
+}
+
+pub fn extract_edges(points: &[Point]) -> Vec<Edge> {
+    let n = points.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    let mut edges = Vec::with_capacity(n);
+    for i in 0..n {
+        let p1 = points[i];
+        let p2 = points[(i + 1) % n];
+        edges.push(Edge::new(p1, p2, i));
+    }
+    edges
+}
+
+pub fn is_truly_irregular(poly: &Polygon, bbox: &Rect, area: f64) -> bool {
+    let bbox_area = bbox.area();
+    if bbox_area <= 1.0 {
+        return false;
+    }
+
+    if poly.is_circular() {
+        return false;
+    }
+
+    let simplified = simplify_collinear(&poly.points, 0.5);
+    if simplified.len() < 3 {
+        return false;
+    }
+
+    if simplified.len() == 4 {
+        let p = Polygon::new(simplified);
+        return !p.is_rectangular();
+    }
+
+    if simplified.len() == 3 {
+        return true;
+    }
+
+    let fill_ratio = area / bbox_area;
+    if fill_ratio < 0.95 {
+        return true;
+    }
+
+    let edges = extract_edges(&simplified);
+    let has_slanted = edges.iter().any(|e| {
+        if e.length < 10.0 {
+            return false;
+        }
+        let deg = (e.angle * 180.0 / std::f64::consts::PI).abs() % 90.0;
+        deg > 3.0 && deg < 87.0
+    });
+
+    if has_slanted {
+        return true;
+    }
+
+    let p = Polygon::new(simplified);
+    !p.is_rectangular()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_circle(radius: f64, segments: usize) -> Polygon {
+        let mut pts = Vec::with_capacity(segments);
+        for i in 0..segments {
+            let angle = 2.0 * std::f64::consts::PI * (i as f64) / (segments as f64);
+            pts.push(Point::new(radius * angle.cos(), radius * angle.sin()));
+        }
+        let poly = Polygon::new(pts);
+        let (norm, _, _) = poly.normalize_to_origin();
+        norm
+    }
+
+    #[test]
+    fn test_circle_collision() {
+        let c1 = make_circle(100.0, 24);
+        let c2 = make_circle(100.0, 24);
+        let c2_shifted = c2.translate(0.0, 150.0);
+        assert!(polygons_collide_with_spacing(&c1, &c2_shifted, 6.0));
+    }
+
+    #[test]
+    fn test_circle_sheet_context() {
+        let c1 = make_circle(100.0, 24);
+        let c2 = make_circle(100.0, 24);
+        let mut ctx = crate::nfp::SheetContext::new(2440.0, 1220.0, 10.0, 6.0, 0.0, false, false, vec!["left".into(), "bottom".into()]);
+        ctx.add_placed(c1.clone(), vec![], 10.0, 10.0, 0.0, false, 0.0);
+        
+        let dilated = offset_polygon(&c2, 3.0);
+        let dilated_bbox = dilated.bounding_box();
+        let can_place = ctx.can_place_precomputed(&c2, &dilated, &dilated_bbox, false, 10.0, 150.0, false, 0.0);
+        assert!(!can_place);
+
+        let anchor = ctx.find_best_anchor(&c2, &dilated, &dilated_bbox, false, false, 0.0, 1.0);
+        assert!(anchor.is_some());
+        let (x, y, _) = anchor.unwrap();
+        assert!(!polygons_collide_with_spacing(&c1.translate(10.0, 10.0), &c2.translate(x, y), 6.0));
+    }
+
+    #[test]
+    fn test_pack_circles() {
+        let c = make_circle(100.0, 24);
+        let mut parts = Vec::new();
+        for i in 0..10 {
+            parts.push(crate::types::PartInput {
+                id: Some(format!("C{}", i)),
+                entity_id: Some(format!("C{}", i)),
+                name: Some(format!("Circle {}", i)),
+                contour: c.to_raw(),
+                holes: None,
+                width: Some(200.0),
+                height: Some(200.0),
+                area: Some(std::f64::consts::PI * 10000.0),
+                render_contour: None,
+                render_holes: None,
+                collision_contour: None,
+                collision_holes: None,
+                draw_layers: None,
+                rotations: None,
+                base_rotation_degrees: None,
+                rotation_degrees: None,
+                grain_locked: None,
+                has_grain_label: None,
+                grain_arrow_degrees: None,
+                free_rotation: None,
+                rotation_divisions: None,
+                color: None,
+                logical_part_count: None,
+                manual_cluster_macro: None,
+                manual_cluster_children: None,
+                two_sided: None,
+                has_circular_arc: None,
+            });
+        }
+        let config = crate::types::ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            part_spacing: Some(6.0),
+            cut_gap: Some(6.0),
+            rotation_divisions: Some(4),
+            ..Default::default()
+        };
+        let mat_state = crate::types::MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(config),
+            original_part_count: None,
+            parts,
+            learning_key: None,
+        };
+        let layout = crate::packing::pack_material(&mat_state, 0);
+        for sheet in &layout.sheets {
+            for i in 0..sheet.placements.len() {
+                let p1 = &sheet.placements[i];
+                let poly1 = Polygon::from_raw(&p1.contour).translate(p1.x, p1.y);
+                for j in (i + 1)..sheet.placements.len() {
+                    let p2 = &sheet.placements[j];
+                    let poly2 = Polygon::from_raw(&p2.contour).translate(p2.x, p2.y);
+                    let collides = polygons_collide_with_spacing(&poly1, &poly2, 6.0);
+                    assert!(!collides, "Collision between {} and {} at ({}, {}) and ({}, {})", 
+                        p1.name.as_deref().unwrap_or(""), p2.name.as_deref().unwrap_or(""), p1.x, p1.y, p2.x, p2.y);
+                }
+            }
+        }
+
+        let opt_layout = crate::epochs::optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});
+        for sheet in &opt_layout.sheets {
+            for i in 0..sheet.placements.len() {
+                let p1 = &sheet.placements[i];
+                let poly1 = Polygon::from_raw(&p1.contour).translate(p1.x, p1.y);
+                for j in (i + 1)..sheet.placements.len() {
+                    let p2 = &sheet.placements[j];
+                    let poly2 = Polygon::from_raw(&p2.contour).translate(p2.x, p2.y);
+                    let collides = polygons_collide_with_spacing(&poly1, &poly2, 6.0);
+                    assert!(!collides, "Collision in opt_layout between {} and {} at ({}, {}) and ({}, {})", 
+                        p1.name.as_deref().unwrap_or(""), p2.name.as_deref().unwrap_or(""), p1.x, p1.y, p2.x, p2.y);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_circle_mating() {
+        let c = make_circle(100.0, 24);
+        let part = crate::types::PartInput {
+            id: Some("C1".into()),
+            entity_id: Some("C1".into()),
+            name: Some("Circle 1".into()),
+            contour: c.to_raw(),
+            holes: None,
+            width: Some(200.0),
+            height: Some(200.0),
+            area: Some(std::f64::consts::PI * 10000.0),
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: None,
+            base_rotation_degrees: None,
+            rotation_degrees: None,
+            grain_locked: None,
+            has_grain_label: None,
+            grain_arrow_degrees: None,
+            free_rotation: None,
+            rotation_divisions: None,
+            color: None,
+            logical_part_count: None,
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+            two_sided: None,
+            has_circular_arc: None,
+        };
+        let config = crate::types::ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            part_spacing: Some(6.0),
+            cut_gap: Some(6.0),
+            rotation_divisions: Some(4),
+            ..Default::default()
+        };
+        let mating = crate::macro_comb::find_best_mating(&part, &part, 6.0, Some(&config));
+        assert!(mating.is_none(), "Circles must never mate into comb macros");
+    }
+
+    #[test]
+    fn test_simulate_sheet13() {
+        let c = make_circle(200.0, 24); // diameter 400
+        let mut parts = Vec::new();
+        // 5 circles
+        for i in 0..5 {
+            parts.push(crate::types::PartInput {
+                id: Some(format!("Circle_{}", i)),
+                entity_id: Some(format!("Circle_{}", i)),
+                name: Some(format!("Circle {}", i)),
+                contour: c.to_raw(),
+                holes: None,
+                width: Some(400.0),
+                height: Some(400.0),
+                area: Some(std::f64::consts::PI * 40000.0),
+                render_contour: None,
+                render_holes: None,
+                collision_contour: None,
+                collision_holes: None,
+                draw_layers: None,
+                rotations: None,
+                base_rotation_degrees: None,
+                rotation_degrees: None,
+                grain_locked: None,
+                has_grain_label: None,
+                grain_arrow_degrees: None,
+                free_rotation: None,
+                rotation_divisions: Some(4),
+                color: None,
+                logical_part_count: None,
+                manual_cluster_macro: None,
+                manual_cluster_children: None,
+                two_sided: None,
+                has_circular_arc: None,
+            });
+        }
+        // 10 right triangles (400 x 400)
+        let tri_contour = vec![[0.0, 0.0], [400.0, 0.0], [0.0, 400.0]];
+        for i in 0..10 {
+            parts.push(crate::types::PartInput {
+                id: Some(format!("Tri_{}", i)),
+                entity_id: Some(format!("Tri_{}", i)),
+                name: Some(format!("Tri {}", i)),
+                contour: tri_contour.clone(),
+                holes: None,
+                width: Some(400.0),
+                height: Some(400.0),
+                area: Some(80000.0),
+                render_contour: None,
+                render_holes: None,
+                collision_contour: None,
+                collision_holes: None,
+                draw_layers: None,
+                rotations: None,
+                base_rotation_degrees: None,
+                rotation_degrees: None,
+                grain_locked: None,
+                has_grain_label: None,
+                grain_arrow_degrees: None,
+                free_rotation: None,
+                rotation_divisions: Some(4),
+                color: None,
+                logical_part_count: None,
+                manual_cluster_macro: None,
+                manual_cluster_children: None,
+                two_sided: None,
+                has_circular_arc: None,
+            });
+        }
+
+        let config = crate::types::ConfigurationInput {
+            board_width: Some(1220.0),
+            board_height: Some(2440.0),
+            edge_margin: Some(10.0),
+            part_spacing: Some(7.0),
+            cut_gap: Some(7.0),
+            rotation_divisions: Some(4),
+            merge_cut_paths: Some(false),
+            small_part_threshold: Some(150.0),
+            small_part_clearance: Some(15.0),
+            ..Default::default()
+        };
+        let mat_state = crate::types::MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(config),
+            original_part_count: None,
+            parts,
+            learning_key: None,
+        };
+
+        let opt_layout = crate::epochs::optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});
+        for sheet in &opt_layout.sheets {
+            for p in &sheet.placements {
+                if p.name.as_deref().unwrap_or("").starts_with("Circle") {
+                    assert_ne!(p.manual_cluster_macro, Some(true), "Circle must not be a macro");
+                }
+            }
+            for i in 0..sheet.placements.len() {
+                let p1 = &sheet.placements[i];
+                let poly1 = Polygon::from_raw(&p1.contour).translate(p1.x, p1.y);
+                for j in (i + 1)..sheet.placements.len() {
+                    let p2 = &sheet.placements[j];
+                    let poly2 = Polygon::from_raw(&p2.contour).translate(p2.x, p2.y);
+                    let collides = polygons_collide_with_spacing(&poly1, &poly2, 7.0);
+                    assert!(!collides, "Collision between {} and {} at ({}, {}) and ({}, {})",
+                        p1.name.as_deref().unwrap_or(""), p2.name.as_deref().unwrap_or(""), p1.x, p1.y, p2.x, p2.y);
+                }
+            }
+        }
+    }
+}
+
