@@ -17,8 +17,8 @@ if not errorlevel 1 (
 cargo build --release --target x86_64-pc-windows-gnu
 if errorlevel 1 exit /b 1
 
-copy /Y "target\x86_64-pc-windows-gnu\release\mn_nesting_engine.exe" "..\mn_nesting_engine.exe" >nul
+copy /Y "target\x86_64-pc-windows-gnu\release\tnp_nesting_engine.exe" "..\tnp_nesting_engine.exe" >nul
 if errorlevel 1 exit /b 1
 
-echo OK: ..\mn_nesting_engine.exe
+echo OK: ..\tnp_nesting_engine.exe
 exit /b 0
