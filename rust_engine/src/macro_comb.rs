@@ -19,6 +19,21 @@ pub fn is_contour_curved(poly: &Polygon, _has_circular_arc: Option<bool>) -> boo
     poly.is_circular()
 }
 
+fn decimate_for_search(poly: &Polygon) -> Polygon {
+    if poly.points.len() <= 48 {
+        return poly.clone();
+    }
+    let d = decimate_curved_polygon(&poly.points, 8.0);
+    if d.points.len() <= 48 {
+        return d;
+    }
+    let step = d.points.len() as f64 / 48.0;
+    let sampled: Vec<Point> = (0..48)
+        .map(|i| d.points[((i as f64 * step) as usize).min(d.points.len() - 1)])
+        .collect();
+    Polygon::new(sampled)
+}
+
 pub fn find_best_mating(
     part_a: &PartInput,
     part_b: &PartInput,
@@ -49,8 +64,14 @@ pub fn find_best_mating(
     let poly_orig_ccw_a = ensure_ccw(&poly_a);
     let poly_orig_ccw_b = ensure_ccw(&poly_b);
 
-    let clean_a = simplify_collinear(&poly_a.points, 0.5);
-    let clean_b = simplify_collinear(&poly_b.points, 0.5);
+    let mut clean_a = simplify_collinear(&poly_a.points, 0.5);
+    if clean_a.len() > 36 {
+        clean_a = decimate_curved_polygon(&poly_orig_ccw_a.points, 12.0).points;
+    }
+    let mut clean_b = simplify_collinear(&poly_b.points, 0.5);
+    if clean_b.len() > 36 {
+        clean_b = decimate_curved_polygon(&poly_orig_ccw_b.points, 12.0).points;
+    }
     if clean_a.len() < 3 || clean_b.len() < 3 {
         return None;
     }
@@ -76,13 +97,32 @@ pub fn find_best_mating(
     let mut candidate_edges_a: Vec<&Edge> = edges_a.iter().filter(|e| e.length >= 15.0).collect();
     if candidate_edges_a.is_empty() {
         candidate_edges_a = edges_a.iter().collect();
+        candidate_edges_a.sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal));
+        candidate_edges_a.truncate(12);
+    } else if candidate_edges_a.len() > 24 {
+        candidate_edges_a.sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal));
+        candidate_edges_a.truncate(24);
     }
     let mut candidate_edges_b: Vec<&Edge> = edges_b.iter().filter(|e| e.length >= 15.0).collect();
     if candidate_edges_b.is_empty() {
         candidate_edges_b = edges_b.iter().collect();
+        candidate_edges_b.sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal));
+        candidate_edges_b.truncate(12);
+    } else if candidate_edges_b.len() > 24 {
+        candidate_edges_b.sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal));
+        candidate_edges_b.truncate(24);
     }
 
     let total_area = area_a + area_b;
+    let orig_boxes_area = bbox_a.area() + bbox_b.area();
+    let is_arc_or_hollow = part_a.has_circular_arc == Some(true)
+        || part_b.has_circular_arc == Some(true)
+        || (orig_boxes_area > 1.0 && total_area / orig_boxes_area < 0.50);
+    let saving_threshold = if is_arc_or_hollow { 0.90 } else { 0.85 };
+    let need_search_decimate = poly_orig_ccw_a.points.len() > 48 || poly_orig_ccw_b.points.len() > 48;
+    let search_poly_a = if need_search_decimate { decimate_for_search(&poly_orig_ccw_a) } else { poly_orig_ccw_a.clone() };
+    let search_poly_b = if need_search_decimate { decimate_for_search(&poly_orig_ccw_b) } else { poly_orig_ccw_b.clone() };
+
     let mut best_score = -1e9;
     let mut best_candidate = None;
 
@@ -132,9 +172,20 @@ pub fn find_best_mating(
                 Point::new(tx, ty)
             };
 
-            let tb_0_points: Vec<Point> = poly_orig_ccw_b.points.iter().map(|&p| transform_b_pt(p)).collect();
-            let poly_b_0 = Polygon::new(tb_0_points);
-            let bbox_b0 = poly_b_0.bounding_box();
+            let mut b0_min_x = f64::INFINITY;
+            let mut b0_min_y = f64::INFINITY;
+            let mut b0_max_x = f64::NEG_INFINITY;
+            let mut b0_max_y = f64::NEG_INFINITY;
+            for &pt in &poly_orig_ccw_b.points {
+                let tp = transform_b_pt(pt);
+                if tp.x < b0_min_x { b0_min_x = tp.x; }
+                if tp.x > b0_max_x { b0_max_x = tp.x; }
+                if tp.y < b0_min_y { b0_min_y = tp.y; }
+                if tp.y > b0_max_y { b0_max_y = tp.y; }
+            }
+            let bbox_b0 = crate::geometry::Rect::new(b0_min_x, b0_min_y, b0_max_x, b0_max_y);
+            let mut search_b_0_opt: Option<Polygon> = None;
+            let mut exact_b_0_opt: Option<Polygon> = None;
 
             let ux = (ea.p2.x - ea.p1.x) / len_a;
             let uy = (ea.p2.y - ea.p1.y) / len_a;
@@ -169,10 +220,11 @@ pub fn find_best_mating(
 
                 let s_start = s_min_x.min(s_max_x) - 10.0;
                 let s_end = s_min_x.max(s_max_x) + 10.0;
+                let step_s = ((s_end - s_start) / 120.0).max(10.0);
                 let mut curr_s = s_start;
                 while curr_s <= s_end {
                     candidate_s.push(curr_s);
-                    curr_s += 10.0;
+                    curr_s += step_s;
                 }
             }
             if uy.abs() > 0.05 {
@@ -184,10 +236,11 @@ pub fn find_best_mating(
 
                 let s_start = s_min_y.min(s_max_y) - 10.0;
                 let s_end = s_min_y.max(s_max_y) + 10.0;
+                let step_s = ((s_end - s_start) / 120.0).max(10.0);
                 let mut curr_s = s_start;
                 while curr_s <= s_end {
                     candidate_s.push(curr_s);
-                    curr_s += 10.0;
+                    curr_s += step_s;
                 }
             }
 
@@ -197,13 +250,7 @@ pub fn find_best_mating(
             for s in candidate_s {
                 let shift_x = s * ux + off_x;
                 let shift_y = s * uy + off_y;
-                let poly_b_s = poly_b_0.translate(shift_x, shift_y);
-
-                if polygons_collide_with_spacing(&poly_orig_ccw_a, &poly_b_s, spacing) {
-                    continue;
-                }
-
-                let bbox_b_s = poly_b_s.bounding_box();
+                let bbox_b_s = bbox_b0.translate(shift_x, shift_y);
                 let comb_min_x = bbox_a.min_x.min(bbox_b_s.min_x);
                 let comb_max_x = bbox_a.max_x.max(bbox_b_s.max_x);
                 let comb_min_y = bbox_a.min_y.min(bbox_b_s.min_y);
@@ -237,11 +284,6 @@ pub fn find_best_mating(
                     continue;
                 }
 
-                let orig_boxes_area = bbox_a.area() + bbox_b.area();
-                let is_arc_or_hollow = part_a.has_circular_arc == Some(true)
-                    || part_b.has_circular_arc == Some(true)
-                    || (orig_boxes_area > 1.0 && total_area / orig_boxes_area < 0.50);
-                let saving_threshold = if is_arc_or_hollow { 0.90 } else { 0.85 };
                 let is_compact_saving = orig_boxes_area > 1.0 && box_area <= orig_boxes_area * saving_threshold;
                 let fill_rate = total_area / box_area;
                 let min_fill = if is_compact_saving {
@@ -259,23 +301,43 @@ pub fn find_best_mating(
                 } else {
                     fill_rate * 1000.0 - w.min(h) * 0.1 - box_area * 0.0005
                 };
-                if score > best_score {
-                    best_score = score;
-                    best_candidate = Some((
-                        w,
-                        h,
-                        fill_rate,
-                        comb_min_x,
-                        comb_min_y,
-                        rot_angle,
-                        origin_bx,
-                        origin_by,
-                        target_x0,
-                        target_y0,
-                        shift_x,
-                        shift_y,
-                    ));
+                if score <= best_score {
+                    continue;
                 }
+
+                if need_search_decimate {
+                    let search_b_0 = search_b_0_opt.get_or_insert_with(|| {
+                        Polygon::new(search_poly_b.points.iter().map(|&p| transform_b_pt(p)).collect())
+                    });
+                    let search_b_s = search_b_0.translate(shift_x, shift_y);
+                    if polygons_collide_with_spacing(&search_poly_a, &search_b_s, spacing) {
+                        continue;
+                    }
+                }
+
+                let exact_b_0 = exact_b_0_opt.get_or_insert_with(|| {
+                    Polygon::new(poly_orig_ccw_b.points.iter().map(|&p| transform_b_pt(p)).collect())
+                });
+                let poly_b_s = exact_b_0.translate(shift_x, shift_y);
+                if polygons_collide_with_spacing(&poly_orig_ccw_a, &poly_b_s, spacing) {
+                    continue;
+                }
+
+                best_score = score;
+                best_candidate = Some((
+                    w,
+                    h,
+                    fill_rate,
+                    comb_min_x,
+                    comb_min_y,
+                    rot_angle,
+                    origin_bx,
+                    origin_by,
+                    target_x0,
+                    target_y0,
+                    shift_x,
+                    shift_y,
+                ));
             }
         }
     }
@@ -948,6 +1010,7 @@ pub fn polygons_collide_concave_safe(poly1: &Polygon, poly2: &Polygon, spacing: 
     if n1 < 3 || n2 < 3 {
         return false;
     }
+    let pad_sq = if pad > 0.0 { pad * pad } else { 0.0 };
     for i in 0..n1 {
         let p1 = poly1.points[i];
         let p2 = poly1.points[(i + 1) % n1];
@@ -972,7 +1035,7 @@ pub fn polygons_collide_concave_safe(poly1: &Polygon, poly2: &Polygon, spacing: 
                 continue;
             }
             if spacing > 1e-4 {
-                if crate::geometry::segment_to_segment_distance(p1, p2, q1, q2) < pad {
+                if crate::geometry::segment_to_segment_distance_sq(p1, p2, q1, q2) < pad_sq {
                     return true;
                 }
             } else if crate::geometry::segments_intersect_proper(p1, p2, q1, q2) {
@@ -1697,6 +1760,7 @@ pub fn pair_comb_parts(
     if parts.len() < 2 {
         return (parts.to_vec(), 0);
     }
+    let comb_start = std::time::Instant::now();
 
     // Step 1: Pre-filter irregular parts that are candidates for comb pairing
     let mut candidate_indices = Vec::new();
@@ -2074,6 +2138,9 @@ pub fn pair_comb_parts(
 
     // Phase 1: Self-mating within identical shape families O(N)
     for (_sig, indices) in groups_by_sig.iter_mut() {
+        if comb_start.elapsed().as_secs_f64() >= 2.5 {
+            break;
+        }
         indices.retain(|&idx| !used[idx]);
         if indices.len() >= 2 {
             // Group two-sided parts and same-room parts together first so they pair cleanly with each other
@@ -2214,6 +2281,9 @@ pub fn pair_comb_parts(
         });
         unpaired_cands.truncate(20);
         for ia in 0..unpaired_cands.len() {
+            if comb_start.elapsed().as_secs_f64() >= 1.5 {
+                break;
+            }
             let idx_a = unpaired_cands[ia];
             if used[idx_a] {
                 continue;
@@ -2221,6 +2291,9 @@ pub fn pair_comb_parts(
             let p_a = Polygon::from_raw(&parts[idx_a].contour);
             let box_a = p_a.bounding_box().area();
             for ib in (ia + 1)..unpaired_cands.len() {
+                if comb_start.elapsed().as_secs_f64() >= 1.5 {
+                    break;
+                }
                 let idx_b = unpaired_cands[ib];
                 let rm_a = crate::types::get_part_room_key(&parts[idx_a]);
                 let rm_b = crate::types::get_part_room_key(&parts[idx_b]);
@@ -2516,6 +2589,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let res = try_build_comb_pair(&part_a, &part_b, 6.0, Some(&config));
@@ -2595,6 +2669,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let res = try_build_comb_pair(&part_a, &part_b, 6.0, Some(&config));
@@ -2660,6 +2735,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let start = std::time::Instant::now();
@@ -2726,6 +2802,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let start = std::time::Instant::now();
@@ -2790,6 +2867,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let mating = find_best_mating(&part_a, &part_b, 6.0, Some(&config)).expect("Must find mating");
@@ -2876,6 +2954,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let prepared_vg = crate::packing::prepare_parts(&[part.clone()], &config_van_go, 6.0);
@@ -2963,6 +3042,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         // Pairing part_0 and part_90 must NOT pair because their grains are perpendicular!
@@ -3047,6 +3127,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
         let res = try_build_comb_pair(&part_a, &part_b, 6.0, Some(&config));
         assert!(res.is_some(), "002_Group corner parts must be successfully comb mated");
@@ -3149,6 +3230,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let all_parts = vec![elbow_macro, tri_a, tri_b];
@@ -3228,6 +3310,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let clean_a = simplify_collinear(&poly.points, 0.5);
@@ -3312,6 +3395,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let (result_parts, comb_count) = pair_comb_parts(&parts, &config, 6.0);
@@ -3386,6 +3470,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let (result_parts, comb_count) = pair_comb_parts(&parts, &config, 6.0);
@@ -3473,6 +3558,7 @@ mod tests {
             small_part_clearance: Some(0.0),
             small_part_edge_zone: Some(0.0),
             merge_cut_paths: Some(false),
+            optimization_seed: None,
         };
 
         let (result_parts, comb_count) = pair_comb_parts(&parts, &config, 6.0);

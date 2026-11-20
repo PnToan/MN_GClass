@@ -234,8 +234,13 @@ pub fn prepare_parts(
         let cached_geoms = if let Some(cg) = geom_cache.get(&raw_key) {
             cg.clone()
         } else {
+            let base_poly = if p.manual_cluster_macro != Some(true) && poly.points.len() > 48 {
+                crate::macro_comb::decimate_curved_polygon(&poly.points, 10.0)
+            } else {
+                poly.clone()
+            };
             let mut geoms: Vec<(f64, f64, f64, Polygon, Vec<Polygon>, Polygon, Rect, Rect, bool)> = allowed_rotations.iter().map(|&rot| {
-                let rotated = poly.rotate_degrees(rot, Point::new(0.0, 0.0));
+                let rotated = base_poly.rotate_degrees(rot, Point::new(0.0, 0.0));
                 let (norm_poly, shift_x, shift_y) = rotated.normalize_to_origin();
                 let bbox = norm_poly.bounding_box();
                 let norm_holes: Vec<Polygon> = effective_holes.as_ref().map_or(Vec::new(), |holes_vec| {
@@ -246,12 +251,7 @@ pub fn prepare_parts(
                     }).collect()
                 });
                 let is_rect = norm_poly.is_rectangular() && norm_holes.is_empty();
-                let col_source = if p.manual_cluster_macro != Some(true) && norm_poly.points.len() > 48 {
-                    crate::macro_comb::decimate_curved_polygon(&norm_poly.points, 10.0)
-                } else {
-                    norm_poly.clone()
-                };
-                let dilated_poly = offset_polygon(&col_source, spacing * 0.5);
+                let dilated_poly = offset_polygon(&norm_poly, spacing * 0.5);
                 let dilated_bbox = dilated_poly.bounding_box();
                 (rot, shift_x, shift_y, norm_poly, norm_holes, dilated_poly, dilated_bbox, bbox, is_rect)
             }).filter(|g| g.7.width() <= max_bw && g.7.height() <= max_bh).collect();

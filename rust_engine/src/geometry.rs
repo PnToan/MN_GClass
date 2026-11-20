@@ -283,17 +283,22 @@ impl Polygon {
 }
 
 #[inline]
-pub fn point_to_segment_distance(p: Point, a: Point, b: Point) -> f64 {
+pub fn point_to_segment_distance_sq(p: Point, a: Point, b: Point) -> f64 {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let l2 = dx * dx + dy * dy;
     if l2 < 1e-12 {
-        return ((p.x - a.x).powi(2) + (p.y - a.y).powi(2)).sqrt();
+        return (p.x - a.x).powi(2) + (p.y - a.y).powi(2);
     }
     let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / l2).clamp(0.0, 1.0);
     let proj_x = a.x + t * dx;
     let proj_y = a.y + t * dy;
-    ((p.x - proj_x).powi(2) + (p.y - proj_y).powi(2)).sqrt()
+    (p.x - proj_x).powi(2) + (p.y - proj_y).powi(2)
+}
+
+#[inline]
+pub fn point_to_segment_distance(p: Point, a: Point, b: Point) -> f64 {
+    point_to_segment_distance_sq(p, a, b).sqrt()
 }
 
 #[inline]
@@ -313,15 +318,21 @@ fn ccw(a: Point, b: Point, c: Point) -> f64 {
 }
 
 #[inline]
-pub fn segment_to_segment_distance(p1: Point, p2: Point, q1: Point, q2: Point) -> f64 {
+pub fn segment_to_segment_distance_sq(p1: Point, p2: Point, q1: Point, q2: Point) -> f64 {
     if segments_intersect_proper(p1, p2, q1, q2) {
         return 0.0;
     }
-    let d1 = point_to_segment_distance(p1, q1, q2);
-    let d2 = point_to_segment_distance(p2, q1, q2);
-    let d3 = point_to_segment_distance(q1, p1, p2);
-    let d4 = point_to_segment_distance(q2, p1, p2);
+    let d1 = point_to_segment_distance_sq(p1, q1, q2);
+    let d2 = point_to_segment_distance_sq(p2, q1, q2);
+    let d3 = point_to_segment_distance_sq(q1, p1, p2);
+    let d4 = point_to_segment_distance_sq(q2, p1, p2);
     d1.min(d2).min(d3).min(d4)
+}
+
+#[allow(dead_code)]
+#[inline]
+pub fn segment_to_segment_distance(p1: Point, p2: Point, q1: Point, q2: Point) -> f64 {
+    segment_to_segment_distance_sq(p1, p2, q1, q2).sqrt()
 }
 
 pub fn polygons_collide_with_spacing(poly1: &Polygon, poly2: &Polygon, spacing: f64) -> bool {
@@ -347,35 +358,62 @@ pub fn polygons_collide_with_spacing(poly1: &Polygon, poly2: &Polygon, spacing: 
         return false;
     }
 
+    let pad = (spacing - 1e-4).max(0.0);
+    let pad_sq = pad * pad;
+
     // 1. Check if any edge-edge distance is strictly less than spacing
     for i in 0..n1 {
         let p1 = poly1.points[i];
         let p2 = poly1.points[(i + 1) % n1];
+        let p_min_x = p1.x.min(p2.x);
+        let p_max_x = p1.x.max(p2.x);
+        if p_max_x <= bbox2.min_x - pad || p_min_x >= bbox2.max_x + pad {
+            continue;
+        }
+        let p_min_y = p1.y.min(p2.y);
+        let p_max_y = p1.y.max(p2.y);
+        if p_max_y <= bbox2.min_y - pad || p_min_y >= bbox2.max_y + pad {
+            continue;
+        }
         for j in 0..n2 {
             let q1 = poly2.points[j];
             let q2 = poly2.points[(j + 1) % n2];
+            if p_max_x <= q1.x.min(q2.x) - pad
+                || p_min_x >= q1.x.max(q2.x) + pad
+                || p_max_y <= q1.y.min(q2.y) - pad
+                || p_min_y >= q1.y.max(q2.y) + pad
+            {
+                continue;
+            }
 
             if spacing > 1e-4 {
-                let d = segment_to_segment_distance(p1, p2, q1, q2);
-                if d < spacing - 1e-4 {
+                if segment_to_segment_distance_sq(p1, p2, q1, q2) < pad_sq {
                     return true;
                 }
-            } else {
-                if segments_intersect_proper(p1, p2, q1, q2) {
-                    return true;
-                }
+            } else if segments_intersect_proper(p1, p2, q1, q2) {
+                return true;
             }
         }
     }
 
     // 2. Comprehensive containment check (any vertex inside the other polygon)
     for pt in &poly1.points {
-        if poly2.contains_point_strict(*pt, 0.0) {
+        if pt.x >= bbox2.min_x - 1e-4
+            && pt.x <= bbox2.max_x + 1e-4
+            && pt.y >= bbox2.min_y - 1e-4
+            && pt.y <= bbox2.max_y + 1e-4
+            && poly2.contains_point_strict(*pt, 0.0)
+        {
             return true;
         }
     }
     for pt in &poly2.points {
-        if poly1.contains_point_strict(*pt, 0.0) {
+        if pt.x >= bbox1.min_x - 1e-4
+            && pt.x <= bbox1.max_x + 1e-4
+            && pt.y >= bbox1.min_y - 1e-4
+            && pt.y <= bbox1.max_y + 1e-4
+            && poly1.contains_point_strict(*pt, 0.0)
+        {
             return true;
         }
     }
@@ -414,16 +452,31 @@ pub fn polygon_contained_in_hole(inner: &Polygon, hole: &Polygon, spacing: f64) 
 
     let n1 = inner.points.len();
     let n2 = hole.points.len();
-    for i in 0..n1 {
-        let p1 = inner.points[i];
-        let p2 = inner.points[(i + 1) % n1];
-        for j in 0..n2 {
-            let q1 = hole.points[j];
-            let q2 = hole.points[(j + 1) % n2];
-            let d1 = point_to_segment_distance(p1, q1, q2);
-            let d2 = point_to_segment_distance(q1, p1, p2);
-            if d1 < spacing - 1e-3 || d2 < spacing - 1e-3 {
-                return false;
+    let min_d = (spacing - 1e-3).max(0.0);
+    let min_d_sq = min_d * min_d;
+    if min_d > 0.0 {
+        for i in 0..n1 {
+            let p1 = inner.points[i];
+            let p2 = inner.points[(i + 1) % n1];
+            let p_min_x = p1.x.min(p2.x);
+            let p_max_x = p1.x.max(p2.x);
+            let p_min_y = p1.y.min(p2.y);
+            let p_max_y = p1.y.max(p2.y);
+            for j in 0..n2 {
+                let q1 = hole.points[j];
+                let q2 = hole.points[(j + 1) % n2];
+                if p_max_x <= q1.x.min(q2.x) - min_d
+                    || p_min_x >= q1.x.max(q2.x) + min_d
+                    || p_max_y <= q1.y.min(q2.y) - min_d
+                    || p_min_y >= q1.y.max(q2.y) + min_d
+                {
+                    continue;
+                }
+                if point_to_segment_distance_sq(p1, q1, q2) < min_d_sq
+                    || point_to_segment_distance_sq(q1, p1, p2) < min_d_sq
+                {
+                    return false;
+                }
             }
         }
     }
@@ -712,6 +765,7 @@ mod tests {
             original_part_count: None,
             parts,
             learning_key: None,
+            optimization_seed: None,
         };
         let layout = crate::packing::pack_material(&mat_state, 0);
         for sheet in &layout.sheets {
@@ -880,6 +934,7 @@ mod tests {
             original_part_count: None,
             parts,
             learning_key: None,
+            optimization_seed: None,
         };
 
         let opt_layout = crate::epochs::optimize_material_layout(&mat_state, |_phase, _pct, _iter, _tot, _lay| {});

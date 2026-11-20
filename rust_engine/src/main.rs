@@ -111,6 +111,31 @@ fn main() {
             return;
         }
 
+        if let Some(ref p_path) = progress_path {
+            let base_pct = ((mat_idx as f64) / (total_materials.max(1) as f64)) * 80.0 + 15.0;
+            let mat_raw = material_state.material.as_deref().unwrap_or("");
+            let mat_label = if mat_raw.is_empty() || mat_raw.contains("__MNROOM") || mat_raw.contains("__MNOPT") {
+                String::new()
+            } else {
+                format!(" ({})", mat_raw)
+            };
+            write_json_atomic(
+                p_path,
+                &ProgressOutput {
+                    running: true,
+                    overall_percent: base_pct.clamp(15.0, 95.0),
+                    optimization_iteration: mat_idx + 1,
+                    optimization_total: total_materials,
+                    message: format!(
+                        "Đang phân tích & xếp nhóm {}/{}{}...",
+                        mat_idx + 1,
+                        total_materials,
+                        mat_label
+                    ),
+                },
+            );
+        }
+
         let p_path_clone = progress_path.clone();
         let prev_path_clone = preview_path.clone();
         let prev_layouts_base = current_layouts.clone();
