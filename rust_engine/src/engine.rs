@@ -15,8 +15,8 @@ mod geom;
 #[path = "spatial.rs"]
 mod spatial;
 
-use geom::{angle_close, build_oriented_poly, norm_deg, rotate_pt, BBox, OrientedPoly, Pt};
-use spatial::{compute_shape_hash, BinRule, PartSpec, SheetConfig, SpatialSheet};
+use geom::{angle_close, build_oriented_poly, norm_deg, poly_contained_in_hole_exact, polys_conflict_exact, rotate_pt, BBox, OrientedPoly, Pt};
+use spatial::{compute_shape_hash, BinRule, PartSpec, PlacedItem, SheetConfig, SpatialSheet};
 
 fn is_part_grain_locked(part: &PartInput, global_rot_div: usize) -> bool {
     if part.free_rotation == Some(false) { return true; }
@@ -63,13 +63,13 @@ fn f64_bits(v: f64) -> u64 {
     if v == 0.0 { 0 } else { v.to_bits() }
 }
 
-fn contour_cache_key(p: &PartInput, rots: &[f64]) -> Vec<u64> {
-    let mut key = Vec::with_capacity(p.contour.len() * 2 + rots.len() + 4);
-    key.push(p.contour.len() as u64);
+fn contour_cache_key(contour: &[[f64; 2]], p: &PartInput, rots: &[f64]) -> Vec<u64> {
+    let mut key = Vec::with_capacity(contour.len() * 2 + rots.len() + 4);
+    key.push(contour.len() as u64);
     key.push(p.holes.as_ref().map_or(0, |h| h.len() as u64));
     key.push(p.area.map_or(0, f64_bits));
     for &r in rots { key.push(f64_bits(r)); }
-    for c in &p.contour { key.push(f64_bits(c[0])); key.push(f64_bits(c[1])); }
+    for c in contour { key.push(f64_bits(c[0])); key.push(f64_bits(c[1])); }
     if let Some(ref hs) = p.holes {
         for h in hs {
             key.push(h.len() as u64);
@@ -86,28 +86,45 @@ fn prepare_parts(material_state: &MaterialStateInput, cfg: &SheetConfig, global_
     let mut specs = Vec::with_capacity(material_state.parts.len());
 
     for p in &material_state.parts {
+        let finite_cnt = p.contour.iter().filter(|c| c[0].is_finite() && c[1].is_finite()).count();
+        let fallback_contour: Option<Vec<[f64; 2]>> = if finite_cnt < 3 {
+            match (p.width, p.height) {
+                (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 => {
+                    Some(vec![[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]])
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let eff_contour: &[[f64; 2]] = fallback_contour.as_deref().unwrap_or(&p.contour);
+
         let rots = allowed_rotations(p, global_rot_div);
-        let ckey = contour_cache_key(p, &rots);
+        let ckey = contour_cache_key(eff_contour, p, &rots);
         let variants = if let Some(cached) = poly_cache.get(&ckey) {
             Arc::clone(cached)
         } else {
             let mut vars: Vec<OrientedPoly> = Vec::with_capacity(rots.len());
             for &r in &rots {
-                let poly = build_oriented_poly(&p.contour, p.holes.as_ref(), r, cfg.spacing, cfg.sheet_in_sheet, p.area);
+                let poly = build_oriented_poly(eff_contour, p.holes.as_ref(), r, cfg.spacing, cfg.sheet_in_sheet, p.area);
                 if poly.is_rect && vars.iter().any(|v| v.is_rect && (v.w - poly.w).abs() < 0.05 && (v.h - poly.h).abs() < 0.05) {
                     continue;
                 }
                 vars.push(poly);
             }
             if vars.is_empty() {
-                vars.push(build_oriented_poly(&p.contour, p.holes.as_ref(), 0.0, cfg.spacing, cfg.sheet_in_sheet, p.area));
+                vars.push(build_oriented_poly(eff_contour, p.holes.as_ref(), 0.0, cfg.spacing, cfg.sheet_in_sheet, p.area));
             }
             let arc = Arc::new(vars);
             poly_cache.insert(ckey, Arc::clone(&arc));
             arc
         };
 
-        let raw_pts: Vec<Pt> = p.contour.iter().map(|c| Pt { x: c[0], y: c[1] }).collect();
+        let raw_pts: Vec<Pt> = eff_contour
+            .iter()
+            .filter(|c| c[0].is_finite() && c[1].is_finite())
+            .map(|c| Pt { x: c[0], y: c[1] })
+            .collect();
         let ob = BBox::from_pts(&raw_pts);
         let ow = p.width.filter(|v| *v > 1e-6).unwrap_or_else(|| ob.w());
         let oh = p.height.filter(|v| *v > 1e-6).unwrap_or_else(|| ob.h());
@@ -547,10 +564,113 @@ fn transform_draw_layers(layers: Option<&Vec<DrawLayerData>>, rot_deg: f64, sx: 
     }).collect())
 }
 
+#[inline]
+fn item_in_board_bounds(cfg: &SheetConfig, it: &PlacedItem, var: &OrientedPoly) -> bool {
+    it.x >= cfg.margin - 1e-4
+        && it.y >= cfg.margin - 1e-4
+        && it.x + var.w <= cfg.board_w - cfg.margin + 1e-4
+        && it.y + var.h <= cfg.board_h - cfg.margin + 1e-4
+}
+
+#[inline]
+fn items_nested_in_hole(
+    parts: &[PartSpec], cfg: &SheetConfig,
+    a: &PlacedItem, va: &OrientedPoly,
+    b: &PlacedItem, vb: &OrientedPoly,
+) -> bool {
+    let _ = parts;
+    cfg.sheet_in_sheet && (
+        vb.holes.iter().any(|h| poly_contained_in_hole_exact(va, a.x, a.y, h, b.x, b.y, 0.0))
+        || va.holes.iter().any(|h| poly_contained_in_hole_exact(vb, b.x, b.y, h, a.x, a.y, 0.0))
+    )
+}
+
+fn find_sheet_violation(parts: &[PartSpec], cfg: &SheetConfig, sh: &SpatialSheet) -> Option<usize> {
+    let n = sh.items.len();
+    for i in 0..n {
+        let a = &sh.items[i];
+        let va = &parts[a.part_idx as usize].variants[a.var_idx as usize];
+        if !item_in_board_bounds(cfg, a, va) {
+            if n > 1 || (a.x - cfg.margin).abs() > 1e-4 || (a.y - cfg.margin).abs() > 1e-4 {
+                return Some(i);
+            }
+        }
+        for j in (i + 1)..n {
+            let b = &sh.items[j];
+            let vb = &parts[b.part_idx as usize].variants[b.var_idx as usize];
+            if !items_nested_in_hole(parts, cfg, a, va, b, vb)
+                && polys_conflict_exact(va, a.x, a.y, vb, b.x, b.y, 0.0)
+            {
+                let area_a = parts[a.part_idx as usize].area;
+                let area_b = parts[b.part_idx as usize].area;
+                return Some(if area_a < area_b { i } else { j });
+            }
+        }
+    }
+    None
+}
+
+fn verify_and_sanitize_sheets(parts: &[PartSpec], cfg: &SheetConfig, sheets: &mut Vec<SpatialSheet>) -> bool {
+    for _round in 0..3 {
+        let mut evicted: Vec<PlacedItem> = Vec::new();
+        for sh in sheets.iter_mut() {
+            while let Some(victim_idx) = find_sheet_violation(parts, cfg, sh) {
+                let victim = sh.items.remove(victim_idx);
+                if victim_idx < sh.item_boxes.len() {
+                    sh.item_boxes.remove(victim_idx);
+                }
+                sh.used_area = sh.items.iter().map(|it| parts[it.part_idx as usize].area).sum();
+                sh.has_two_sided = sh.items.iter().any(|it| parts[it.part_idx as usize].two_sided);
+                evicted.push(victim);
+            }
+        }
+        sheets.retain(|sh| !sh.items.is_empty());
+        if evicted.is_empty() {
+            break;
+        }
+        for victim in evicted {
+            let mut ns = SpatialSheet::new(cfg);
+            ns.commit_placement(
+                parts,
+                cfg,
+                victim.part_idx as usize,
+                victim.var_idx as usize,
+                cfg.margin,
+                cfg.margin,
+            );
+            sheets.push(ns);
+        }
+    }
+
+    let mut total_items = 0usize;
+    for sh in sheets.iter() {
+        let n = sh.items.len();
+        total_items += n;
+        for i in 0..n {
+            let a = &sh.items[i];
+            let va = &parts[a.part_idx as usize].variants[a.var_idx as usize];
+            if !item_in_board_bounds(cfg, a, va) {
+                return false;
+            }
+            for j in (i + 1)..n {
+                let b = &sh.items[j];
+                let vb = &parts[b.part_idx as usize].variants[b.var_idx as usize];
+                if !items_nested_in_hole(parts, cfg, a, va, b, vb)
+                    && polys_conflict_exact(va, a.x, a.y, vb, b.x, b.y, 0.0)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    total_items == parts.len()
+}
+
 fn materialize_layout(
     material_state: &MaterialStateInput, cfg: &SheetConfig, parts: &[PartSpec],
     mut sheets: Vec<SpatialSheet>, compact_directions: Vec<String>, target_util: f64, global_rot_div: usize,
 ) -> LayoutOutput {
+    let verified_clean = verify_and_sanitize_sheets(parts, cfg, &mut sheets);
     sheets.sort_by(|a, b| b.has_two_sided.cmp(&a.has_two_sided)
         .then_with(|| b.used_area.partial_cmp(&a.used_area).unwrap_or(std::cmp::Ordering::Equal)));
     let board_area = (cfg.board_w * cfg.board_h).max(1.0);
@@ -634,7 +754,7 @@ fn materialize_layout(
         front_load_score: front_load, alignment_score: 0.0, compact_direction_score: 0.0,
         target_deficit_score: target_deficit, comb_pair_placements: 0, staircase_pattern_placements: 0,
         priority_zone_fill_placements: 0, pocket_evacuated_sheets: 0, priority_zone_fill_area: 0.0,
-        safety_certified: true, safety_version: 2,
+        safety_certified: verified_clean, safety_version: 2,
     }
 }
 
@@ -652,7 +772,7 @@ where
     let small_thr = raw_cfg.small_part_threshold.unwrap_or(0.0).max(0.0);
     let small_clr = raw_cfg.small_part_clearance.unwrap_or(0.0).max(0.0);
     let merge_cut = raw_cfg.merge_cut_paths.unwrap_or(false);
-    let edge_zone = if merge_cut { let cz = raw_cfg.small_part_edge_zone.unwrap_or(0.0); if cz > 0.0 { cz } else { 200.0 } } else { 0.0 };
+    let edge_zone = raw_cfg.small_part_edge_zone.unwrap_or(if merge_cut { 200.0 } else { 0.0 }).max(0.0);
     let compact_dirs = raw_cfg.compact_directions.unwrap_or_else(|| vec!["left".to_string(), "bottom".to_string()]);
     let target_util = raw_cfg.target_sheet_utilization.unwrap_or(90.0);
 
@@ -721,4 +841,252 @@ where
     let layout = materialize_layout(material_state, &cfg, &parts, best_sheets, compact_dirs, target_util, global_rot_div);
     on_progress("Done", 100.0, 1, 1, &layout);
     layout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ConfigurationInput;
+
+    fn make_part(id: &str, contour: Vec<[f64; 2]>, holes: Option<Vec<Vec<[f64; 2]>>>) -> PartInput {
+        PartInput {
+            id: Some(id.to_string()),
+            entity_id: Some(id.to_string()),
+            name: Some(id.to_string()),
+            width: None,
+            height: None,
+            area: None,
+            contour,
+            holes,
+            render_contour: None,
+            render_holes: None,
+            collision_contour: None,
+            collision_holes: None,
+            draw_layers: None,
+            rotations: Some(vec![0.0]),
+            base_rotation_degrees: Some(0.0),
+            rotation_degrees: Some(0.0),
+            grain_locked: Some(true),
+            has_grain_label: None,
+            grain_arrow_degrees: None,
+            free_rotation: Some(false),
+            rotation_divisions: Some(1),
+            color: None,
+            logical_part_count: None,
+            manual_cluster_macro: None,
+            manual_cluster_children: None,
+            two_sided: None,
+            has_circular_arc: None,
+        }
+    }
+
+    fn test_cfg(sheet_in_sheet: bool) -> SheetConfig {
+        SheetConfig {
+            board_w: 1220.0,
+            board_h: 2440.0,
+            margin: 10.0,
+            usable_w: 1200.0,
+            usable_h: 2420.0,
+            spacing: 5.0,
+            sheet_in_sheet,
+            small_thr: 0.0,
+            small_clr: 0.0,
+            merge_cut: false,
+            edge_zone: 0.0,
+            max_possible_gap: 5.0,
+            compact_right: false,
+            compact_top: false,
+        }
+    }
+
+    #[test]
+    fn test_a_solid_arch_over_64_verts_vs_bottom_overlap() {
+        // Vòm đặc > 64 đỉnh: outer 800x600, đáy khoét vòm từ x=150..650 lên đỉnh y=450
+        let mut arch_contour = vec![
+            [0.0, 0.0],
+            [150.0, 0.0],
+        ];
+        let arc_steps = 72usize;
+        for i in 0..=arc_steps {
+            let theta = std::f64::consts::PI * (1.0 - (i as f64) / (arc_steps as f64));
+            let x = 400.0 + 250.0 * theta.cos();
+            let y = 200.0 + 250.0 * theta.sin();
+            arch_contour.push([x, y]);
+        }
+        arch_contour.push([650.0, 0.0]);
+        arch_contour.push([800.0, 0.0]);
+        arch_contour.push([800.0, 600.0]);
+        arch_contour.push([0.0, 600.0]);
+        assert!(arch_contour.len() > 64);
+
+        let arch = build_oriented_poly(&arch_contour, None, 0.0, 0.0, false, None);
+        let small_box = build_oriented_poly(
+            &[[0.0, 0.0], [200.0, 0.0], [200.0, 200.0], [0.0, 200.0]],
+            None,
+            0.0,
+            0.0,
+            false,
+            None,
+        );
+
+        // Nằm gọn trong khoang lõm đáy vòm (x=300..500, y=0..200) -> không va chạm
+        assert!(!polys_conflict_exact(&arch, 0.0, 0.0, &small_box, 300.0, 0.0, 0.0));
+        // Đè lên chân đáy trái (x=0..200, y=0..200) -> phải báo va chạm
+        assert!(polys_conflict_exact(&arch, 0.0, 0.0, &small_box, 0.0, 0.0, 0.0));
+        // Đè lên đỉnh vòm (x=300..500, y=400..600) -> phải báo va chạm
+        assert!(polys_conflict_exact(&arch, 0.0, 0.0, &small_box, 300.0, 400.0, 0.0));
+    }
+
+    #[test]
+    fn test_b_multi_level_hole_nesting() {
+        // Vòm/khung ngoài 1000x800 có lỗ 800x600 -> chứa khung giữa 700x500 có lỗ 500x300 -> chứa thanh con 300x150
+        let outer = make_part(
+            "outer",
+            vec![[0.0, 0.0], [1000.0, 0.0], [1000.0, 800.0], [0.0, 800.0]],
+            Some(vec![vec![[100.0, 100.0], [900.0, 100.0], [900.0, 700.0], [100.0, 700.0]]]),
+        );
+        let middle = make_part(
+            "middle",
+            vec![[0.0, 0.0], [700.0, 0.0], [700.0, 500.0], [0.0, 500.0]],
+            Some(vec![vec![[100.0, 100.0], [600.0, 100.0], [600.0, 400.0], [100.0, 400.0]]]),
+        );
+        let inner_bar = make_part(
+            "inner_bar",
+            vec![[0.0, 0.0], [300.0, 0.0], [300.0, 150.0], [0.0, 150.0]],
+            None,
+        );
+
+        let mat = MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.0),
+            group_index: None,
+            configuration: Some(ConfigurationInput {
+                board_width: Some(1050.0),
+                board_height: Some(850.0),
+                edge_margin: Some(10.0),
+                part_spacing: Some(5.0),
+                sheet_in_sheet: Some(true),
+                rotation_divisions: Some(1),
+                ..Default::default()
+            }),
+            original_part_count: Some(3),
+            parts: vec![outer, middle, inner_bar],
+            learning_key: None,
+            optimization_seed: Some(42),
+        };
+
+        let layout = optimize_material_layout(&mat, |_, _, _, _, _| {});
+        assert!(layout.safety_certified);
+        assert_eq!(layout.sheets.len(), 1, "All 3 multi-level nested parts must fit on 1 sheet");
+        assert_eq!(layout.sheets[0].placements.len(), 3);
+    }
+
+    #[test]
+    fn test_c_concave_overlap_and_touching_rects_at_zero_gap() {
+        // Chữ C lõm có centroid nằm ngoài phần thịt đa giác
+        let c_shape = build_oriented_poly(
+            &[
+                [0.0, 0.0], [400.0, 0.0], [400.0, 40.0], [40.0, 40.0],
+                [40.0, 460.0], [400.0, 460.0], [400.0, 500.0], [0.0, 500.0],
+            ],
+            None,
+            0.0,
+            0.0,
+            false,
+            None,
+        );
+        assert!(!c_shape.centroid_inside);
+        // Hai đa giác lõm trùng khít tại gap = 0.0 phải báo conflict
+        assert!(polys_conflict_exact(&c_shape, 100.0, 100.0, &c_shape, 100.0, 100.0, 0.0));
+
+        // Hai hình chữ nhật chạm cạnh khít tại gap = 0.0 không báo giả
+        let rect = build_oriented_poly(
+            &[[0.0, 0.0], [200.0, 0.0], [200.0, 300.0], [0.0, 300.0]],
+            None,
+            0.0,
+            0.0,
+            false,
+            None,
+        );
+        assert!(!polys_conflict_exact(&rect, 0.0, 0.0, &rect, 200.0, 0.0, 0.0));
+        assert!(!polys_conflict_exact(&rect, 0.0, 0.0, &rect, 0.0, 300.0, 0.0));
+        // Và đa giác lõm chạm cạnh hình chữ nhật tại gap = 0.0 không báo giả
+        assert!(!polys_conflict_exact(&c_shape, 0.0, 0.0, &rect, 400.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_d_gap_008_conflict() {
+        // Đa giác không phải rect thuần để đi qua kiểm tra đa giác chính xác (không qua fast-path rect)
+        let poly_a = build_oriented_poly(
+            &[[0.0, 0.0], [100.0, 0.0], [100.0, 95.0], [95.0, 100.0], [0.0, 100.0]],
+            None,
+            0.0,
+            0.0,
+            false,
+            None,
+        );
+        let small_b = build_oriented_poly(
+            &[[0.0, 0.0], [10.0, 0.0], [10.0, 9.0], [9.0, 10.0], [0.0, 10.0]],
+            None,
+            0.0,
+            0.0,
+            false,
+            None,
+        );
+
+        // Khoảng cách cạnh 0.04 < gap = 0.08 -> phải báo conflict
+        assert!(polys_conflict_exact(&poly_a, 0.0, 0.0, &small_b, 100.04, 0.0, 0.08));
+        // Nằm lọt bên trong cách biên 0.10 (trước đây pt_tol=0.14 bỏ sót) -> phải báo conflict tại gap = 0.08
+        assert!(polys_conflict_exact(&poly_a, 0.0, 0.0, &small_b, 0.10, 0.10, 0.08));
+        // Cách nhau 0.12 > gap = 0.08 -> không báo conflict
+        assert!(!polys_conflict_exact(&poly_a, 0.0, 0.0, &small_b, 100.12, 0.0, 0.08));
+    }
+
+    #[test]
+    fn test_e_verify_and_sanitize_sheets_evicts_overlap() {
+        let big = make_part("big", vec![[0.0, 0.0], [500.0, 0.0], [500.0, 500.0], [0.0, 500.0]], None);
+        let small = make_part("small", vec![[0.0, 0.0], [200.0, 0.0], [200.0, 200.0], [0.0, 200.0]], None);
+        let mat = MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.0),
+            group_index: None,
+            configuration: Some(ConfigurationInput {
+                board_width: Some(1220.0),
+                board_height: Some(2440.0),
+                edge_margin: Some(10.0),
+                part_spacing: Some(5.0),
+                sheet_in_sheet: Some(false),
+                rotation_divisions: Some(1),
+                ..Default::default()
+            }),
+            original_part_count: Some(2),
+            parts: vec![big, small],
+            learning_key: None,
+            optimization_seed: Some(42),
+        };
+        let cfg = test_cfg(false);
+        let (specs, _) = prepare_parts(&mat, &cfg, 1);
+
+        let mut sh = SpatialSheet::new(&cfg);
+        sh.commit_placement(&specs, &cfg, 0, 0, 10.0, 10.0);
+        sh.commit_placement(&specs, &cfg, 1, 0, 10.0, 10.0); // cố tình đè lên tấm lớn
+        let mut sheets = vec![sh];
+
+        assert!(verify_and_sanitize_sheets(&specs, &cfg, &mut sheets));
+        assert_eq!(sheets.len(), 2);
+        assert_eq!(sheets[0].items.len(), 1);
+        assert_eq!(sheets[0].items[0].part_idx, 0);
+        assert!((sheets[0].used_area - 250_000.0).abs() < 1e-3);
+        assert_eq!(sheets[1].items.len(), 1);
+        assert_eq!(sheets[1].items[0].part_idx, 1);
+        assert!((sheets[1].items[0].x - cfg.margin).abs() < 1e-6);
+        assert!((sheets[1].items[0].y - cfg.margin).abs() < 1e-6);
+        assert!((sheets[1].used_area - 40_000.0).abs() < 1e-3);
+
+        let layout = materialize_layout(&mat, &cfg, &specs, sheets, vec!["left".to_string()], 90.0, 1);
+        assert!(layout.safety_certified);
+        assert_eq!(layout.sheets.len(), 2);
+    }
 }

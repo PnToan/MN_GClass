@@ -1,7 +1,7 @@
 // src/spatial.rs - Compact SpatialSheet with adaptive 2D grid, incremental MaxRects
 // free-space manager, exact clearance/hole/bounds checks, and fast polygon sliding.
 use std::sync::Arc;
-use super::geom::{poly_contained_in_hole_exact, polys_conflict_exact, BBox, OrientedPoly};
+use super::geom::{point_in_poly_local, poly_contained_in_hole_exact, polys_conflict_exact, BBox, OrientedPoly, Pt};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SheetConfig {
@@ -242,8 +242,10 @@ impl SpatialSheet {
                 if var.w > fr.w + 1e-4 || var.h > fr.h + 1e-4 { continue; }
                 let mut cx = if cfg.compact_right { fr.x + fr.w - var.w } else { fr.x };
                 let mut cy = if cfg.compact_top { fr.y + fr.h - var.h } else { fr.y };
-                cx = cx.clamp(cfg.margin, cfg.board_w - cfg.margin - var.w);
-                cy = cy.clamp(cfg.margin, cfg.board_h - cfg.margin - var.h);
+                let max_x_clamped = (cfg.board_w - cfg.margin - var.w).max(cfg.margin);
+                let max_y_clamped = (cfg.board_h - cfg.margin - var.h).max(cfg.margin);
+                cx = cx.clamp(cfg.margin, max_x_clamped);
+                cy = cy.clamp(cfg.margin, max_y_clamped);
 
                 let (rx, ry) = ((fr.w - var.w).max(0.0), (fr.h - var.h).max(0.0));
                 let (s1, s2) = match rule {
@@ -343,8 +345,10 @@ impl SpatialSheet {
             let host_area = host.w * host.h;
             for (v_idx, var) in pspec.variants.iter().enumerate() {
                 if var.w > cfg.usable_w + 1e-4 || var.h > cfg.usable_h + 1e-4 { continue; }
-                let fy_n = (host.y + 0.05).clamp(cfg.margin, max_y - var.h);
-                let fx_n = host.x.clamp(cfg.margin, max_x - var.w);
+                let max_y_clamped = (max_y - var.h).max(cfg.margin);
+                let max_x_clamped = (max_x - var.w).max(cfg.margin);
+                let fy_n = (host.y + 0.05).clamp(cfg.margin, max_y_clamped);
+                let fx_n = host.x.clamp(cfg.margin, max_x_clamped);
                 let trials = [
                     (true, (host.x + host.w + gap).min(max_x - var.w), host.x.max(cfg.margin), fy_n),
                     (false, (host.y + host.h + gap).min(max_y - var.h), host.y.max(cfg.margin), fx_n),
@@ -374,11 +378,33 @@ impl SpatialSheet {
         best
     }
 
-    fn inject_clipped_rect(&self, added: &mut Vec<FreeRect>, raw: BBox, ox: f64, oy: f64, prev_count: usize) {
+    fn inject_clipped_rect(
+        &self, parts: &[PartSpec], cfg: &SheetConfig,
+        added: &mut Vec<FreeRect>, raw: BBox, ox: f64, oy: f64, prev_count: usize,
+    ) {
         let mut fr_list = vec![FreeRect { x: ox + raw.min_x, y: oy + raw.min_y, w: raw.w(), h: raw.h() }];
+        let corners = [
+            Pt { x: ox + raw.min_x, y: oy + raw.min_y },
+            Pt { x: ox + raw.max_x, y: oy + raw.min_y },
+            Pt { x: ox + raw.max_x, y: oy + raw.max_y },
+            Pt { x: ox + raw.min_x, y: oy + raw.max_y },
+        ];
         for prev_i in 0..prev_count {
+            let prev_item = &self.items[prev_i];
+            if cfg.sheet_in_sheet {
+                let prev_var = &parts[prev_item.part_idx as usize].variants[prev_item.var_idx as usize];
+                if !prev_var.holes.is_empty() {
+                    let inside_prev_hole = prev_var.holes.iter().any(|ph| {
+                        corners.iter().all(|c| {
+                            let local_pt = Pt { x: c.x - prev_item.x, y: c.y - prev_item.y };
+                            point_in_poly_local(local_pt, &ph.pts, &ph.chunks, 0.0)
+                        })
+                    });
+                    if inside_prev_hole { continue; }
+                }
+            }
             let pb = self.item_boxes[prev_i];
-            let pg = self.items[prev_i].req_clr;
+            let pg = prev_item.req_clr;
             fr_list = clip_rects_against_box(fr_list, pb[0] - pg, pb[1] - pg, pb[2] + pg, pb[3] + pg);
             if fr_list.is_empty() { return; }
         }
@@ -418,7 +444,7 @@ impl SpatialSheet {
             let mut added = self.subtract_box_from_free_rects(x - cg, y - cg, x + var.w + cg, y + var.h + cg);
             if cfg.sheet_in_sheet {
                 for h in &var.holes {
-                    if let Some(ir) = h.inscribed_rect { self.inject_clipped_rect(&mut added, ir, x, y, item_idx); }
+                    if let Some(ir) = h.inscribed_rect { self.inject_clipped_rect(parts, cfg, &mut added, ir, x, y, item_idx); }
                 }
             }
             self.merge_and_prune_added(added);

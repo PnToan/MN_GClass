@@ -210,22 +210,51 @@ fn any_vertex_or_centroid_inside(src: &OrientedPoly, dst: &OrientedPoly, dx: f64
     for i in 0..n {
         let p = src.pts[i];
         let q = Pt { x: p.x + dx, y: p.y + dy };
-        if q.x <= dst.w + 0.01 && q.y >= -0.01 && q.y <= dst.h + 0.01
+        if q.x >= -0.01 && q.x <= dst.w + 0.01 && q.y >= -0.01 && q.y <= dst.h + 0.01
             && point_in_poly_local(q, &dst.pts, &dst.chunks, tol)
         { return true; }
         if check_midpoints {
             let p2 = src.pts[(i + 1) % n];
             let m = Pt { x: 0.5 * (p.x + p2.x) + dx, y: 0.5 * (p.y + p2.y) + dy };
-            if m.x <= dst.w + 0.01 && m.y >= -0.01 && m.y <= dst.h + 0.01
+            if m.x >= -0.01 && m.x <= dst.w + 0.01 && m.y >= -0.01 && m.y <= dst.h + 0.01
                 && point_in_poly_local(m, &dst.pts, &dst.chunks, tol)
             { return true; }
         }
     }
     if src.centroid_inside {
         let c = Pt { x: src.centroid.x + dx, y: src.centroid.y + dy };
-        if c.x <= dst.w + 0.01 && c.y >= -0.01 && c.y <= dst.h + 0.01
+        if c.x >= -0.01 && c.x <= dst.w + 0.01 && c.y >= -0.01 && c.y <= dst.h + 0.01
             && point_in_poly_local(c, &dst.pts, &dst.chunks, tol)
         { return true; }
+    }
+    false
+}
+
+#[inline]
+fn any_inward_edge_sample_inside(src: &OrientedPoly, dst: &OrientedPoly, dx: f64, dy: f64) -> bool {
+    let n = src.pts.len();
+    if n < 3 || dst.pts.len() < 3 { return false; }
+    for i in 0..n {
+        let p1 = src.pts[i];
+        let p2 = src.pts[(i + 1) % n];
+        let (ex, ey) = (p2.x - p1.x, p2.y - p1.y);
+        let len = (ex * ex + ey * ey).sqrt();
+        if len <= 1e-4 { continue; }
+        let (mx, my) = (0.5 * (p1.x + p2.x), 0.5 * (p1.y + p2.y));
+        let (nx, ny) = (-ey / len, ex / len);
+        for sign in [0.08_f64, -0.08_f64] {
+            let s_src = Pt { x: mx + sign * nx, y: my + sign * ny };
+            if point_in_poly_local(s_src, &src.pts, &src.chunks, 0.02) {
+                let s_dst = Pt { x: s_src.x + dx, y: s_src.y + dy };
+                if s_dst.x >= -0.01 && s_dst.x <= dst.w + 0.01
+                    && s_dst.y >= -0.01 && s_dst.y <= dst.h + 0.01
+                    && point_in_poly_local(s_dst, &dst.pts, &dst.chunks, 0.02)
+                {
+                    return true;
+                }
+                break;
+            }
+        }
     }
     false
 }
@@ -273,10 +302,18 @@ pub fn polys_conflict_exact(
             }
         }
     }
-    let pt_tol = if eff_gap > 0.0 { 0.14 } else { 0.05 };
+    let pt_tol = if eff_gap > 0.0 { eff_gap.min(0.14).max(1e-4) } else { 0.05 };
     let mid = eff_gap == 0.0;
-    any_vertex_or_centroid_inside(a, b, dx, dy, pt_tol, mid)
+    if any_vertex_or_centroid_inside(a, b, dx, dy, pt_tol, mid)
         || any_vertex_or_centroid_inside(b, a, -dx, -dy, pt_tol, mid)
+    {
+        return true;
+    }
+    if eff_gap == 0.0 {
+        return any_inward_edge_sample_inside(a, b, dx, dy)
+            || any_inward_edge_sample_inside(b, a, -dx, -dy);
+    }
+    false
 }
 
 /// Exact check: is `inner` at `(ix, iy)` strictly inside `hole` of host at `(hx, hy)` with `req_gap`?
@@ -285,6 +322,7 @@ pub fn poly_contained_in_hole_exact(
     hole: &OrientedHole, hx: f64, hy: f64,
     req_gap: f64,
 ) -> bool {
+    if inner.pts.len() < 3 || hole.pts.len() < 3 { return false; }
     let eff_gap = req_gap + 0.04;
     let (dx, dy) = (ix - hx, iy - hy);
     if dx < hole.bbox.min_x + eff_gap || dx + inner.w > hole.bbox.max_x - eff_gap
@@ -445,24 +483,37 @@ pub fn build_oriented_poly(
     rot_deg: f64, spacing: f64, sheet_in_sheet: bool, area_override: Option<f64>,
 ) -> OrientedPoly {
     let rot_deg = norm_deg(rot_deg);
-    let mut rot_pts: Vec<Pt> = raw_contour.iter().map(|c| rotate_pt(Pt { x: c[0], y: c[1] }, rot_deg)).collect();
+    let mut rot_pts: Vec<Pt> = raw_contour
+        .iter()
+        .filter(|c| c[0].is_finite() && c[1].is_finite())
+        .map(|c| rotate_pt(Pt { x: c[0], y: c[1] }, rot_deg))
+        .collect();
     let b = BBox::from_pts(&rot_pts);
     let (shift_x, shift_y) = (-b.min_x, -b.min_y);
     for p in &mut rot_pts { p.x += shift_x; p.y += shift_y; }
     let (w, h) = (b.w(), b.h());
     let poly_area = poly_signed_area(&rot_pts).abs();
-    let area = area_override.filter(|v| *v > 1e-4).unwrap_or(poly_area);
+    let area = area_override.filter(|v| v.is_finite() && *v > 1e-4).unwrap_or(poly_area);
     let fill_ratio = (poly_area / (w * h).max(1e-6)).clamp(0.0, 1.0);
 
     let mut holes_out = Vec::new();
     if let Some(hs) = raw_holes {
         for h_raw in hs {
-            if h_raw.len() < 3 { continue; }
-            let hpts: Vec<Pt> = h_raw.iter().map(|c| {
-                let rp = rotate_pt(Pt { x: c[0], y: c[1] }, rot_deg);
-                Pt { x: rp.x + shift_x, y: rp.y + shift_y }
-            }).collect();
+            let hpts: Vec<Pt> = h_raw
+                .iter()
+                .filter(|c| c[0].is_finite() && c[1].is_finite())
+                .map(|c| {
+                    let rp = rotate_pt(Pt { x: c[0], y: c[1] }, rot_deg);
+                    Pt { x: rp.x + shift_x, y: rp.y + shift_y }
+                })
+                .collect();
+            if hpts.len() < 3 { continue; }
+            let hole_area = poly_signed_area(&hpts).abs();
+            if hole_area < 1e-2 || hole_area >= poly_area - 1e-2 { continue; }
             let hb = BBox::from_pts(&hpts);
+            if hb.min_x < -0.5 || hb.min_y < -0.5 || hb.max_x > w + 0.5 || hb.max_y > h + 0.5 {
+                continue;
+            }
             let hchunks = build_chunks(&hpts);
             let inscribed_rect = if sheet_in_sheet { extract_hole_inscribed_rect(&hpts, &hchunks, &hb, spacing) } else { None };
             holes_out.push(OrientedHole { pts: hpts, bbox: hb, chunks: hchunks, inscribed_rect });
