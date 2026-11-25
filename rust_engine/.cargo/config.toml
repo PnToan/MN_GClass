@@ -1,2 +1,2 @@
 [target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "link-arg=-LC:/Users/PC/AppData/Roaming/SketchUp/SKF01E~1/SketchUp/Plugins/mn_gcode/data/engine/RUST_E~1/lib"]
+rustflags = ["-L", "native=C:\\Users\\PC\\AppData\\Roaming\\SketchUp\\SketchUp 2024\\SketchUp\\Plugins\\tnp_sketch_cut\\engine\\rust_engine\\lib"]
