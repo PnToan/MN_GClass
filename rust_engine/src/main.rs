@@ -6,35 +6,25 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-mod geometry;
+mod engine;
 mod types;
-mod nfp;
-mod macro_comb;
-mod scoring;
-mod packing;
-mod epochs;
 
-use types::{JobInput, ProgressOutput, ResultOutput, LayoutOutput, PreviewOutput};
+use types::{JobInput, LayoutOutput, PreviewOutput, ProgressOutput, ResultOutput};
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
-    for i in 0..args.len() {
-        if args[i] == flag && i + 1 < args.len() {
-            return Some(args[i + 1].clone());
-        }
-    }
-    None
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].clone())
 }
 
 fn is_cancelled(cancel_path: Option<&PathBuf>) -> bool {
-    if let Some(path) = cancel_path {
-        path.exists()
-    } else {
-        false
-    }
+    cancel_path.is_some_and(|p| p.exists())
 }
 
 fn write_json_atomic<T: serde::Serialize>(target_path: &Path, data: &T) {
-    let Ok(json_str) = serde_json::to_string(data) else { return; };
+    let Ok(json_str) = serde_json::to_string(data) else {
+        return;
+    };
     let tmp_path = target_path.with_extension("tmp");
     if let Ok(mut f) = File::create(&tmp_path) {
         let _ = f.write_all(json_str.as_bytes());
@@ -67,7 +57,8 @@ fn main() {
 
     let workers_count = parse_arg(&args, "--workers")
         .and_then(|w| w.parse::<usize>().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+        .max(1);
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(workers_count)
@@ -83,7 +74,6 @@ fn main() {
     let total_materials = job_input.materials.len();
     let mut current_layouts: Vec<LayoutOutput> = Vec::with_capacity(total_materials);
 
-    // 1. FAST INITIAL PROGRESS
     if let Some(ref p_path) = progress_path {
         write_json_atomic(
             p_path,
@@ -97,18 +87,44 @@ fn main() {
         );
     }
 
-    // 2. MAX-SPEED MULTI-THREADED PARALLEL OPTIMIZATION
     for (mat_idx, material_state) in job_input.materials.iter().enumerate() {
         if is_cancelled(cancel_path.as_ref()) {
-            let cancel_res = ResultOutput {
-                ok: false,
-                layouts: vec![],
-                population_total: 0,
-                message: "Đã dừng tiến trình Nesting.".to_string(),
-                cancelled: true,
-            };
-            write_json_atomic(&result_path, &cancel_res);
+            write_json_atomic(
+                &result_path,
+                &ResultOutput {
+                    ok: false,
+                    layouts: vec![],
+                    population_total: 0,
+                    message: "Đã dừng tiến trình Nesting.".to_string(),
+                    cancelled: true,
+                },
+            );
             return;
+        }
+
+        if let Some(ref p_path) = progress_path {
+            let base_pct = ((mat_idx as f64) / (total_materials.max(1) as f64)) * 80.0 + 15.0;
+            let mat_raw = material_state.material.as_deref().unwrap_or("");
+            let mat_label = if mat_raw.is_empty() || mat_raw.contains("__MNROOM") || mat_raw.contains("__MNOPT") {
+                String::new()
+            } else {
+                format!(" ({})", mat_raw)
+            };
+            write_json_atomic(
+                p_path,
+                &ProgressOutput {
+                    running: true,
+                    overall_percent: base_pct.clamp(15.0, 95.0),
+                    optimization_iteration: mat_idx + 1,
+                    optimization_total: total_materials,
+                    message: format!(
+                        "Đang phân tích & xếp nhóm {}/{}{}...",
+                        mat_idx + 1,
+                        total_materials,
+                        mat_label
+                    ),
+                },
+            );
         }
 
         let p_path_clone = progress_path.clone();
@@ -117,77 +133,85 @@ fn main() {
         let mut last_prev_ms: u128 = 0;
         let mut last_prog_ms: u128 = 0;
 
-        let final_mat_layout = epochs::optimize_material_layout(material_state, |phase, local_pct, iter, total, layout_variant| {
-            let base_pct = ((mat_idx as f64) / (total_materials as f64)) * 80.0 + 15.0;
-            let mat_slice = 80.0 / (total_materials as f64);
-            let pct = (base_pct + (local_pct / 100.0) * mat_slice).clamp(15.0, 95.0);
-            let now_ms = start_time.elapsed().as_millis();
-            let is_milestone = total > 0 || iter <= 1;
+        let final_mat_layout =
+            engine::optimize_material_layout(material_state, |phase, local_pct, iter, total, layout_variant| {
+                let base_pct = ((mat_idx as f64) / (total_materials.max(1) as f64)) * 80.0 + 15.0;
+                let mat_slice = 80.0 / (total_materials.max(1) as f64);
+                let pct = (base_pct + (local_pct / 100.0) * mat_slice).clamp(15.0, 95.0);
+                let now_ms = start_time.elapsed().as_millis();
+                let is_milestone = total > 0 || iter <= 1;
 
-            if let Some(ref prev_path) = prev_path_clone {
-                let total_sheets_now = prev_layouts_base.iter().map(|l| l.sheets.len()).sum::<usize>() + layout_variant.sheets.len();
-                let total_parts_now = prev_layouts_base.iter().flat_map(|l| &l.sheets).map(|s| s.placements.len()).sum::<usize>()
-                    + layout_variant.sheets.iter().map(|s| s.placements.len()).sum::<usize>();
-                if total_sheets_now <= 20 && total_parts_now <= 350 && (is_milestone || last_prev_ms == 0 || now_ms.saturating_sub(last_prev_ms) >= 450) {
-                    last_prev_ms = now_ms;
-                    let mut prev_layouts = prev_layouts_base.clone();
-                    prev_layouts.push(layout_variant.clone());
-                    write_json_atomic(
-                        prev_path,
-                        &PreviewOutput {
-                            ok: true,
-                            partial: true,
-                            layouts: prev_layouts,
-                        },
-                    );
+                if let Some(ref prev_path) = prev_path_clone {
+                    let total_sheets_now = prev_layouts_base.iter().map(|l| l.sheets.len()).sum::<usize>()
+                        + layout_variant.sheets.len();
+                    let total_parts_now = prev_layouts_base
+                        .iter()
+                        .flat_map(|l| &l.sheets)
+                        .map(|s| s.placements.len())
+                        .sum::<usize>()
+                        + layout_variant.sheets.iter().map(|s| s.placements.len()).sum::<usize>();
+                    if total_sheets_now <= 20
+                        && total_parts_now <= 350
+                        && (is_milestone || last_prev_ms == 0 || now_ms.saturating_sub(last_prev_ms) >= 450)
+                    {
+                        last_prev_ms = now_ms;
+                        let mut prev_layouts = prev_layouts_base.clone();
+                        prev_layouts.push(layout_variant.clone());
+                        write_json_atomic(
+                            prev_path,
+                            &PreviewOutput {
+                                ok: true,
+                                partial: true,
+                                layouts: prev_layouts,
+                            },
+                        );
+                    }
                 }
-            }
 
-            if let Some(ref p_path) = p_path_clone {
-                if is_milestone || last_prog_ms == 0 || now_ms.saturating_sub(last_prog_ms) >= 180 {
-                    last_prog_ms = now_ms;
-                    let cur_elapsed = start_time.elapsed().as_secs_f64();
-                    let time_str = if cur_elapsed >= 60.0 {
-                        let m = (cur_elapsed / 60.0).floor() as u64;
-                        let rem = cur_elapsed % 60.0;
-                        format!("{}p {:.1}s", m, rem)
-                    } else {
-                        format!("{:.2}s", cur_elapsed)
-                    };
-                    let iter_str = if total > 0 {
-                        format!("chiến lược {}/{}", iter, total)
-                    } else {
-                        format!("tấm {}", iter)
-                    };
-                    write_json_atomic(
-                        p_path,
-                        &ProgressOutput {
-                            running: true,
-                            overall_percent: pct,
-                            optimization_iteration: iter,
-                            optimization_total: total,
-                            message: format!(
-                                "Đang {} ({}, {})...",
-                                phase,
-                                iter_str,
-                                time_str
-                            ),
-                        },
-                    );
+                if let Some(ref p_path) = p_path_clone {
+                    if is_milestone || last_prog_ms == 0 || now_ms.saturating_sub(last_prog_ms) >= 180 {
+                        last_prog_ms = now_ms;
+                        let cur_elapsed = start_time.elapsed().as_secs_f64();
+                        let time_str = if cur_elapsed >= 60.0 {
+                            let m = (cur_elapsed / 60.0).floor() as u64;
+                            let rem = cur_elapsed % 60.0;
+                            format!("{}p {:.1}s", m, rem)
+                        } else {
+                            format!("{:.2}s", cur_elapsed)
+                        };
+                        let iter_str = if total > 0 {
+                            format!("chiến lược {}/{}", iter, total)
+                        } else {
+                            format!("tấm {}", iter)
+                        };
+                        write_json_atomic(
+                            p_path,
+                            &ProgressOutput {
+                                running: true,
+                                overall_percent: pct,
+                                optimization_iteration: iter,
+                                optimization_total: total,
+                                message: format!("Đang {} ({}, {})...", phase, iter_str, time_str),
+                            },
+                        );
+                    }
                 }
-            }
-        });
+            });
 
         current_layouts.push(final_mat_layout);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     let total_sheets: usize = current_layouts.iter().map(|l| l.sheets.len()).sum();
-    let total_parts: usize = current_layouts.iter().map(|l| {
-        l.sheets.iter().map(|s| {
-            s.placements.iter().map(|p| p.logical_part_count.unwrap_or(1)).sum::<usize>()
-        }).sum::<usize>()
-    }).sum();
+    let total_parts: usize = current_layouts
+        .iter()
+        .map(|l| {
+            l.sheets
+                .iter()
+                .map(|s| s.placements.iter().map(|p| p.logical_part_count.unwrap_or(1)).sum::<usize>())
+                .sum::<usize>()
+        })
+        .sum();
 
     let time_str = if elapsed >= 60.0 {
         let m = (elapsed / 60.0).floor() as u64;
@@ -197,18 +221,27 @@ fn main() {
         format!("{:.2} giây", elapsed)
     };
 
-    let final_message = format!(
-        "Nesting hoàn thành: {} tấm, {} chi tiết trong {}.",
-        total_sheets,
-        total_parts,
-        time_str
-    );
+    if let Some(ref p_path) = progress_path {
+        write_json_atomic(
+            p_path,
+            &ProgressOutput {
+                running: false,
+                overall_percent: 100.0,
+                optimization_iteration: 10,
+                optimization_total: 10,
+                message: format!("Nesting hoàn thành: {} tấm, {} chi tiết trong {}.", total_sheets, total_parts, time_str),
+            },
+        );
+    }
 
     let result = ResultOutput {
         ok: true,
         layouts: current_layouts,
         population_total: 10,
-        message: final_message,
+        message: format!(
+            "Nesting hoàn thành: {} tấm, {} chi tiết trong {}.",
+            total_sheets, total_parts, time_str
+        ),
         cancelled: false,
     };
 
