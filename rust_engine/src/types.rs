@@ -45,6 +45,8 @@ pub struct ConfigurationInput {
     pub small_part_clearance: Option<f64>,
     pub small_part_edge_zone: Option<f64>,
     pub merge_cut_paths: Option<bool>,
+    #[serde(default)]
+    pub nest_by_room: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

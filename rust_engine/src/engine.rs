@@ -150,7 +150,8 @@ fn prepare_parts(material_state: &MaterialStateInput, cfg: &SheetConfig, global_
             perimeter: 2.0 * (v0.w + v0.h),
             is_low_fill: !v0.is_rect && v0.fill_ratio < 0.78,
             has_holes: !v0.holes.is_empty(),
-            two_sided: p.two_sided == Some(true),
+            two_sided: p.two_sided == Some(true)
+                || p.manual_cluster_children.as_ref().is_some_and(|cs| cs.iter().any(|c| c.two_sided == Some(true))),
             variants, area, min_bbox_area, max_dim, min_dim, small_part, small_part_clearance, room_id,
         });
     }
@@ -190,23 +191,33 @@ fn cmp_order(pa: &PartSpec, pb: &PartSpec, order: SortOrder) -> std::cmp::Orderi
     }
 }
 
-fn build_order(parts: &[PartSpec], order: SortOrder, sis: bool, two_sided_first: bool, boosts: Option<&[u32]>) -> Vec<usize> {
-    let mut idxs: Vec<usize> = (0..parts.len()).collect();
+fn build_order_subset(
+    parts: &[PartSpec], subset: &[usize], order: SortOrder, sis: bool, two_sided_first: bool, boosts: Option<&[u32]>,
+) -> Vec<usize> {
+    let mut idxs: Vec<usize> = subset.to_vec();
     idxs.sort_by(|&a, &b| {
-        if let Some(bs) = boosts { if bs[a] != bs[b] { return bs[b].cmp(&bs[a]); } }
         let (pa, pb) = (&parts[a], &parts[b]);
-        if sis && pa.has_holes != pb.has_holes { return pb.has_holes.cmp(&pa.has_holes); }
         if two_sided_first && pa.two_sided != pb.two_sided { return pb.two_sided.cmp(&pa.two_sided); }
+        if let Some(bs) = boosts { if bs[a] != bs[b] { return bs[b].cmp(&bs[a]); } }
+        if sis && pa.has_holes != pb.has_holes { return pb.has_holes.cmp(&pa.has_holes); }
         cmp_order(pa, pb, order).then_with(|| a.cmp(&b))
     });
     idxs
 }
 
-fn pack_order(
+fn build_order(
+    parts: &[PartSpec], order: SortOrder, sis: bool, two_sided_first: bool, boosts: Option<&[u32]>,
+) -> Vec<usize> {
+    let all: Vec<usize> = (0..parts.len()).collect();
+    build_order_subset(parts, &all, order, sis, two_sided_first, boosts)
+}
+
+fn pack_order_onto(
     parts: &[PartSpec], cfg: &SheetConfig, order: &[usize],
     rule: BinRule, best_fit_all: bool, max_sheets_limit: Option<usize>,
+    initial_sheets: Vec<SpatialSheet>,
 ) -> Option<Vec<SpatialSheet>> {
-    let mut sheets: Vec<SpatialSheet> = Vec::with_capacity(8);
+    let mut sheets = initial_sheets;
     let perfect_cutoff = match rule { BinRule::Bssf | BinRule::Blsf => 0.5, BinRule::Baf => 25.0, _ => -1e9 };
 
     for &p_idx in order {
@@ -267,14 +278,33 @@ fn pack_order(
     Some(sheets)
 }
 
+fn pack_order(
+    parts: &[PartSpec], cfg: &SheetConfig, order: &[usize],
+    rule: BinRule, best_fit_all: bool, max_sheets_limit: Option<usize>,
+) -> Option<Vec<SpatialSheet>> {
+    pack_order_onto(parts, cfg, order, rule, best_fit_all, max_sheets_limit, Vec::with_capacity(8))
+}
+
 #[inline]
-fn solution_score(sheets: &[SpatialSheet]) -> (usize, i64) {
-    // Fewer sheets strictly wins; ties prefer higher sum(used_area^2) to concentrate slack onto sparse tails
+fn count_two_sided_sheets(sheets: &[SpatialSheet]) -> usize {
+    sheets.iter().filter(|s| s.has_two_sided).count()
+}
+
+#[inline]
+fn solution_score(sheets: &[SpatialSheet], strict_two_sided: bool) -> (usize, usize, i64) {
+    // Fewer sheets strictly wins (or fewer 2-sided sheets first when strict_two_sided);
+    // ties prefer higher sum(used_area^2) to concentrate slack onto sparse tails
     let sum_sq: f64 = sheets.iter().map(|s| {
         let u = s.used_area * 1e-4;
         u * u
     }).sum();
-    (sheets.len(), -(sum_sq * 100.0).round() as i64)
+    let neg_sq = -(sum_sq * 100.0).round() as i64;
+    let ts_sheets = count_two_sided_sheets(sheets);
+    if strict_two_sided {
+        (ts_sheets, sheets.len(), neg_sq)
+    } else {
+        (sheets.len(), ts_sheets, neg_sq)
+    }
 }
 
 struct XorRng(u64);
@@ -293,7 +323,10 @@ impl XorRng {
     fn range(&mut self, n: usize) -> usize { if n <= 1 { 0 } else { (self.next_u64() as usize) % n } }
 }
 
-fn try_repack_subset(parts: &[PartSpec], cfg: &SheetConfig, subset: &[usize], target: usize) -> Option<Vec<SpatialSheet>> {
+fn try_repack_subset(
+    parts: &[PartSpec], cfg: &SheetConfig, subset: &[usize], target: usize,
+    two_sided_first: bool, max_ts_sheets: Option<usize>,
+) -> Option<Vec<SpatialSheet>> {
     const ORDERS: [(SortOrder, BinRule, bool); 6] = [
         (SortOrder::MaxSideDesc, BinRule::Bssf, true),
         (SortOrder::AreaDesc, BinRule::Bssf, true),
@@ -306,79 +339,131 @@ fn try_repack_subset(parts: &[PartSpec], cfg: &SheetConfig, subset: &[usize], ta
         let mut sub = subset.to_vec();
         sub.sort_by(|&a, &b| {
             let (pa, pb) = (&parts[a], &parts[b]);
+            if two_sided_first && pa.two_sided != pb.two_sided { return pb.two_sided.cmp(&pa.two_sided); }
             if cfg.sheet_in_sheet && pa.has_holes != pb.has_holes { return pb.has_holes.cmp(&pa.has_holes); }
             cmp_order(pa, pb, ord_kind).then_with(|| a.cmp(&b))
         });
         if let Some(res) = pack_order(parts, cfg, &sub, rule, bf_all, Some(target)) {
-            if res.len() <= target { return Some(res); }
+            if res.len() <= target && max_ts_sheets.is_none_or(|lim| count_two_sided_sheets(&res) <= lim) {
+                return Some(res);
+            }
         }
     }
     None
 }
 
-fn evict_sparsest_sheet(parts: &[PartSpec], cfg: &SheetConfig, best: &mut Vec<SpatialSheet>) {
+fn try_evict_sheet(
+    parts: &[PartSpec], cfg: &SheetConfig, best: &mut Vec<SpatialSheet>,
+    min_idx: usize, protect_two_sided: bool,
+) -> bool {
     let usable_area = cfg.usable_w * cfg.usable_h;
+    let free_sum: f64 = best.iter().enumerate()
+        .filter(|&(i, _)| i != min_idx)
+        .map(|(_, s)| (usable_area - s.used_area).max(0.0))
+        .sum();
+    if best[min_idx].used_area > free_sum { return false; }
+    let mut trial: Vec<SpatialSheet> = best.iter().enumerate()
+        .filter(|&(i, _)| i != min_idx)
+        .map(|(_, s)| s.clone())
+        .collect();
+    for it in &best[min_idx].items {
+        let p_idx = it.part_idx as usize;
+        let mut placed = false;
+        if parts[p_idx].is_low_fill {
+            for sh in &mut trial {
+                if protect_two_sided && parts[p_idx].two_sided && !sh.has_two_sided { continue; }
+                if !sh.low_fill_items.is_empty() {
+                    if let Some((vi, x, y, _)) = sh.find_polygon_slide(parts, cfg, p_idx) {
+                        sh.commit_placement(parts, cfg, p_idx, vi, x, y);
+                        placed = true; break;
+                    }
+                }
+            }
+        }
+        if !placed {
+            let (mut bs1, mut bs2, mut bf) = (f64::MAX, f64::MAX, None);
+            for (si, sh) in trial.iter().enumerate() {
+                if protect_two_sided && parts[p_idx].two_sided && !sh.has_two_sided { continue; }
+                if let Some((vi, x, y, s1, s2)) = sh.find_best_free_rect(parts, cfg, p_idx, BinRule::Bssf, bs1, bs2) {
+                    bs1 = s1; bs2 = s2; bf = Some((si, vi, x, y));
+                }
+            }
+            if let Some((si, vi, x, y)) = bf { trial[si].commit_placement(parts, cfg, p_idx, vi, x, y); placed = true; }
+        }
+        if !placed { return false; }
+    }
+    *best = trial;
+    true
+}
+
+fn evict_sparsest_sheet(parts: &[PartSpec], cfg: &SheetConfig, best: &mut Vec<SpatialSheet>, protect_two_sided: bool) {
     while best.len() > 1 {
         let Some((min_idx, _)) = best.iter().enumerate()
             .min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal))
         else { break; };
-        let free_sum: f64 = best.iter().enumerate().filter(|&(i, _)| i != min_idx).map(|(_, s)| (usable_area - s.used_area).max(0.0)).sum();
-        if best[min_idx].used_area > free_sum { break; }
-        let mut trial: Vec<SpatialSheet> = best.iter().enumerate().filter(|&(i, _)| i != min_idx).map(|(_, s)| s.clone()).collect();
-        let mut all_fit = true;
-        for it in &best[min_idx].items {
-            let p_idx = it.part_idx as usize;
-            let mut placed = false;
-            if parts[p_idx].is_low_fill {
-                for sh in &mut trial {
-                    if !sh.low_fill_items.is_empty() {
-                        if let Some((vi, x, y, _)) = sh.find_polygon_slide(parts, cfg, p_idx) {
-                            sh.commit_placement(parts, cfg, p_idx, vi, x, y);
-                            placed = true; break;
-                        }
-                    }
-                }
+        if try_evict_sheet(parts, cfg, best, min_idx, protect_two_sided) { continue; }
+        if protect_two_sided && best[min_idx].has_two_sided {
+            if let Some((min_1s, _)) = best.iter().enumerate()
+                .filter(|(_, s)| !s.has_two_sided)
+                .min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                if try_evict_sheet(parts, cfg, best, min_1s, true) { continue; }
             }
-            if !placed {
-                let (mut bs1, mut bs2, mut bf) = (f64::MAX, f64::MAX, None);
-                for (si, sh) in trial.iter().enumerate() {
-                    if let Some((vi, x, y, s1, s2)) = sh.find_best_free_rect(parts, cfg, p_idx, BinRule::Bssf, bs1, bs2) {
-                        bs1 = s1; bs2 = s2; bf = Some((si, vi, x, y));
-                    }
-                }
-                if let Some((si, vi, x, y)) = bf { trial[si].commit_placement(parts, cfg, p_idx, vi, x, y); placed = true; }
-            }
-            if !placed { all_fit = false; break; }
         }
-        if all_fit { *best = trial; } else { break; }
+        break;
     }
 }
 
-fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSheet>, seed: u64) -> Vec<SpatialSheet> {
-    if best.len() <= 1 { return best; }
+fn squeeze_sheets_opts(
+    parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSheet>, seed: u64,
+    active_subset: Option<&[usize]>, seed_sheets: Option<&[SpatialSheet]>,
+    two_sided_first: bool, strict_two_sided: bool,
+) -> Vec<SpatialSheet> {
+    let all_idxs_storage: Option<Vec<usize>> = if active_subset.is_none() {
+        Some((0..parts.len()).collect())
+    } else {
+        None
+    };
+    let active_idxs: &[usize] = active_subset.unwrap_or_else(|| all_idxs_storage.as_deref().unwrap());
+    let min_sheets_stop = seed_sheets.map_or(1, |s| s.len().max(1));
+    if best.len() <= min_sheets_stop || active_idxs.is_empty() { return best; }
     let usable_area = cfg.usable_w * cfg.usable_h;
 
     // 1. Iterative Tail-Boosted Repack
-    let boost_rounds = if parts.len() > 1000 { 4 } else { 6 };
+    let boost_rounds = if active_idxs.len() > 1000 { 4 } else { 6 };
     let mut boosts = vec![0u32; parts.len()];
     for round in 0..boost_rounds {
-        let Some((min_idx, _)) = best.iter().enumerate()
-            .min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal))
-        else { break; };
-        for it in &best[min_idx].items { boosts[it.part_idx as usize] += 1; }
+        let min_idx_opt = if seed_sheets.is_some() {
+            best.iter().enumerate()
+                .filter(|(_, s)| !s.has_two_sided)
+                .min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal))
+                .or_else(|| best.iter().enumerate().min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal)))
+        } else {
+            best.iter().enumerate()
+                .min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal))
+        };
+        let Some((min_idx, _)) = min_idx_opt else { break; };
+        for it in &best[min_idx].items {
+            let p_idx = it.part_idx as usize;
+            if seed_sheets.is_none() || !parts[p_idx].two_sided {
+                boosts[p_idx] += 1;
+            }
+        }
         let rule = if round % 2 == 0 { BinRule::Bssf } else { BinRule::Baf };
         let ord_kind = match round % 3 { 0 => SortOrder::MaxSideDesc, 1 => SortOrder::AreaDesc, _ => SortOrder::WeightedDimDesc };
-        let order = build_order(parts, ord_kind, cfg.sheet_in_sheet, false, Some(&boosts));
-        if let Some(cand) = pack_order(parts, cfg, &order, rule, true, Some(best.len())) {
-            if solution_score(&cand) < solution_score(&best) {
+        let order = build_order_subset(parts, active_idxs, ord_kind, cfg.sheet_in_sheet, two_sided_first, Some(&boosts));
+        let init_sheets = seed_sheets.map_or_else(|| Vec::with_capacity(8), |s| s.to_vec());
+        if let Some(cand) = pack_order_onto(parts, cfg, &order, rule, true, Some(best.len()), init_sheets) {
+            if solution_score(&cand, strict_two_sided) < solution_score(&best, strict_two_sided) {
                 best = cand;
-                if best.len() <= 1 { return best; }
+                if best.len() <= min_sheets_stop { return best; }
             }
         }
     }
 
     // 2. Direct single-part eviction of sparsest sheet into earlier sheets
-    evict_sparsest_sheet(parts, cfg, &mut best);
+    evict_sparsest_sheet(parts, cfg, &mut best, two_sided_first || strict_two_sided);
+    if best.len() <= min_sheets_stop { return best; }
 
     // 3. Exact 2 -> 1 Sheet-Pair Consolidation
     let mut improved = true;
@@ -391,11 +476,14 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
             for &b in idxs.iter().take(lim).skip(ii + 1) {
                 if best[a].used_area + best[b].used_area > usable_area * 0.995 { break; }
                 let comb: Vec<usize> = best[a].items.iter().chain(&best[b].items).map(|it| it.part_idx as usize).collect();
-                if let Some(mut merged) = try_repack_subset(parts, cfg, &comb, 1) {
-                    best.remove(a.max(b)); best.remove(a.min(b));
-                    best.push(merged.pop().unwrap());
-                    improved = true;
-                    break 'pair;
+                let max_ts = 1usize.min(usize::from(best[a].has_two_sided) + usize::from(best[b].has_two_sided));
+                if let Some(mut merged) = try_repack_subset(parts, cfg, &comb, 1, two_sided_first || strict_two_sided, Some(max_ts)) {
+                    if merged.len() == 1 {
+                        best.remove(a.max(b)); best.remove(a.min(b));
+                        best.push(merged.pop().unwrap());
+                        improved = true;
+                        break 'pair;
+                    }
                 }
             }
         }
@@ -416,7 +504,9 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
                     tries += 1;
                     if tries > 14 { break 'tri; }
                     let comb: Vec<usize> = best[a].items.iter().chain(&best[b].items).chain(&best[c].items).map(|it| it.part_idx as usize).collect();
-                    if let Some(merged) = try_repack_subset(parts, cfg, &comb, 2) {
+                    let orig_ts = usize::from(best[a].has_two_sided) + usize::from(best[b].has_two_sided) + usize::from(best[c].has_two_sided);
+                    let max_ts = if strict_two_sided || two_sided_first { Some(orig_ts) } else { None };
+                    if let Some(merged) = try_repack_subset(parts, cfg, &comb, 2, two_sided_first || strict_two_sided, max_ts) {
                         let mut rem = [a, b, c]; rem.sort_unstable();
                         best.remove(rem[2]); best.remove(rem[1]); best.remove(rem[0]);
                         best.extend(merged);
@@ -430,22 +520,23 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
     }
 
     // 5. Time-Budgeted Waste-Targeted Bounded ALNS
-    let total_area: f64 = parts.iter().map(|p| p.area).sum();
-    let min_possible = (total_area / usable_area).ceil().max(1.0) as usize;
+    let total_area: f64 = active_idxs.iter().map(|&i| parts[i].area).sum::<f64>()
+        + seed_sheets.map_or(0.0, |ss| ss.iter().map(|s| s.used_area).sum());
+    let min_possible = (total_area / usable_area).ceil().max(min_sheets_stop as f64) as usize;
     if best.len() <= min_possible {
         return best;
     }
-    let budget_ms = if parts.len() <= 100 { 45 } else if parts.len() <= 600 { 80 } else { 110 };
+    let budget_ms = if active_idxs.len() <= 100 { 45 } else if active_idxs.len() <= 600 { 80 } else { 110 };
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
-    let mut rng = XorRng::new(seed ^ (parts.len() as u64).wrapping_mul(0x517C_C1B7_2722_0A95));
-    let mut best_sc = solution_score(&best);
+    let mut rng = XorRng::new(seed ^ (active_idxs.len() as u64).wrapping_mul(0x517C_C1B7_2722_0A95));
+    let mut best_sc = solution_score(&best, strict_two_sided);
 
-    // Small/medium materials: fast random-key + tail-boosted full repacks (nails 10-85 part bin-packing!)
-    if parts.len() <= 100 && best.len() > min_possible {
+    // 5A. Small/medium materials: fast 60 random-key + tail-boosted full repacks
+    if active_idxs.len() <= 100 && best.len() > min_possible {
         let rules_sm = [BinRule::Bssf, BinRule::Baf, BinRule::Blsf, BinRule::BottomLeft];
         for it in 0..60 {
             if Instant::now() >= deadline || best.len() <= min_possible { break; }
-            let mut scored: Vec<(usize, f64)> = (0..parts.len()).map(|pi| {
+            let mut scored: Vec<(usize, f64)> = active_idxs.iter().map(|&pi| {
                 let p = &parts[pi];
                 let base = match it % 4 {
                     0 => p.area,
@@ -458,33 +549,55 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
             }).collect();
             // Boost parts currently on sparsest sheet every 3rd iteration
             if it % 3 == 2 {
-                if let Some((_, sh)) = best.iter().enumerate().min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal)) {
-                    for itm in &sh.items { scored[itm.part_idx as usize].1 *= 1.6; }
+                let sh_opt = if seed_sheets.is_some() {
+                    best.iter().enumerate()
+                        .filter(|(_, s)| !s.has_two_sided)
+                        .min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal))
+                } else {
+                    best.iter().enumerate()
+                        .min_by(|a, b| a.1.used_area.partial_cmp(&b.1.used_area).unwrap_or(std::cmp::Ordering::Equal))
+                };
+                if let Some((_, sh)) = sh_opt {
+                    for itm in &sh.items {
+                        let pi = itm.part_idx as usize;
+                        if seed_sheets.is_some() && parts[pi].two_sided { continue; }
+                        if let Some(entry) = scored.iter_mut().find(|(epi, _)| *epi == pi) {
+                            entry.1 *= 1.6;
+                        }
+                    }
                 }
             }
             scored.sort_by(|a, b| {
                 let (pa, pb) = (&parts[a.0], &parts[b.0]);
+                if two_sided_first && pa.two_sided != pb.two_sided { return pb.two_sided.cmp(&pa.two_sided); }
                 if cfg.sheet_in_sheet && pa.has_holes != pb.has_holes { return pb.has_holes.cmp(&pa.has_holes); }
                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             });
             let ord: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
             let rule = rules_sm[it % rules_sm.len()];
             let bf_all = it % 5 != 4;
-            if let Some(cand) = pack_order(parts, cfg, &ord, rule, bf_all, Some(best.len())) {
-                let sc = solution_score(&cand);
+            let init_sheets = seed_sheets.map_or_else(|| Vec::with_capacity(8), |s| s.to_vec());
+            if let Some(cand) = pack_order_onto(parts, cfg, &ord, rule, bf_all, Some(best.len()), init_sheets) {
+                let sc = solution_score(&cand, strict_two_sided);
                 if sc < best_sc { best = cand; best_sc = sc; }
             }
         }
     }
 
-    let max_alns = if parts.len() <= 150 { 20 } else if parts.len() <= 600 { 14 } else { 10 };
+    // 5B. Bounded ALNS
+    let max_alns = if active_idxs.len() <= 150 { 20 } else if active_idxs.len() <= 600 { 14 } else { 10 };
     for iter in 0..max_alns {
         if Instant::now() >= deadline || best.len() <= min_possible { break; }
         let n_sh = best.len();
-        let mut ranked: Vec<usize> = (0..n_sh).collect();
+        let mut ranked: Vec<usize> = if strict_two_sided {
+            (0..n_sh).filter(|&i| !best[i].has_two_sided).collect()
+        } else {
+            (0..n_sh).collect()
+        };
+        if ranked.len() < 2 { break; }
         ranked.sort_by(|&a, &b| best[a].used_area.partial_cmp(&best[b].used_area).unwrap_or(std::cmp::Ordering::Equal));
         let target_waste = usable_area * (1.15 + 0.12 * (iter % 3) as f64);
-        let max_ruin = n_sh.min(12);
+        let max_ruin = ranked.len().min(12);
         let mut mask = vec![false; n_sh];
         let (mut r_waste, mut r_cnt) = (0.0f64, 0usize);
         if iter % 2 == 0 {
@@ -494,7 +607,7 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
             }
         } else {
             mask[ranked[0]] = true; r_waste += (usable_area - best[ranked[0]].used_area).max(0.0); r_cnt = 1;
-            let pool_lim = (n_sh * 2 / 3).max(2).min(n_sh);
+            let pool_lim = (ranked.len() * 2 / 3).max(2).min(ranked.len());
             for _ in 0..24 {
                 if r_cnt >= max_ruin || (r_cnt >= 2 && r_waste >= target_waste) { break; }
                 let pick = ranked[rng.range(pool_lim)];
@@ -512,7 +625,13 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
             let base = match iter % 3 { 0 => p.area, 1 => p.max_dim, _ => p.min_dim };
             (pi, base * (0.85 + 0.30 * rng.next_f64()))
         }).collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            if !strict_two_sided && two_sided_first {
+                let (pa, pb) = (&parts[a.0], &parts[b.0]);
+                if pa.two_sided != pb.two_sided { return pb.two_sided.cmp(&pa.two_sided); }
+            }
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let rule = if iter % 2 == 0 { BinRule::Bssf } else { BinRule::Baf };
         let mut leftover = Vec::new();
         // Try inserting ruined parts into the sparsest kept sheets first
@@ -523,6 +642,9 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
             let mut placed = false;
             let (mut bs1, mut bs2, mut bf) = (f64::MAX, f64::MAX, None);
             for &si in &k_idx[..scan_cap] {
+                if !strict_two_sided && two_sided_first && parts[pi].two_sided && !kept[si].has_two_sided {
+                    continue;
+                }
                 if let Some((vi, x, y, s1, s2)) = kept[si].find_best_free_rect(parts, cfg, pi, rule, bs1, bs2) {
                     bs1 = s1; bs2 = s2; bf = Some((si, vi, x, y));
                 }
@@ -538,11 +660,14 @@ fn squeeze_sheets(parts: &[PartSpec], cfg: &SheetConfig, mut best: Vec<SpatialSh
                 continue;
             }
         }
-        let sc = solution_score(&kept);
+        let sc = solution_score(&kept, strict_two_sided);
         if sc < best_sc {
-            let dropped = sc.0 < best_sc.0;
+            let dropped = kept.len() < best.len();
             best = kept; best_sc = sc;
-            if dropped { evict_sparsest_sheet(parts, cfg, &mut best); best_sc = solution_score(&best); }
+            if dropped {
+                evict_sparsest_sheet(parts, cfg, &mut best, two_sided_first || strict_two_sided);
+                best_sc = solution_score(&best, strict_two_sided);
+            }
         }
     }
     best
@@ -671,8 +796,16 @@ fn materialize_layout(
     mut sheets: Vec<SpatialSheet>, compact_directions: Vec<String>, target_util: f64, global_rot_div: usize,
 ) -> LayoutOutput {
     let verified_clean = verify_and_sanitize_sheets(parts, cfg, &mut sheets);
-    sheets.sort_by(|a, b| b.has_two_sided.cmp(&a.has_two_sided)
-        .then_with(|| b.used_area.partial_cmp(&a.used_area).unwrap_or(std::cmp::Ordering::Equal)));
+    sheets.sort_by(|a, b| {
+        let a_ts_cnt = a.items.iter().filter(|it| parts[it.part_idx as usize].two_sided).count();
+        let b_ts_cnt = b.items.iter().filter(|it| parts[it.part_idx as usize].two_sided).count();
+        let a_ts_area: f64 = a.items.iter().filter(|it| parts[it.part_idx as usize].two_sided).map(|it| parts[it.part_idx as usize].area).sum();
+        let b_ts_area: f64 = b.items.iter().filter(|it| parts[it.part_idx as usize].two_sided).map(|it| parts[it.part_idx as usize].area).sum();
+        b.has_two_sided.cmp(&a.has_two_sided)
+            .then_with(|| b_ts_cnt.cmp(&a_ts_cnt))
+            .then_with(|| b_ts_area.partial_cmp(&a_ts_area).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.used_area.partial_cmp(&a.used_area).unwrap_or(std::cmp::Ordering::Equal))
+    });
     let board_area = (cfg.board_w * cfg.board_h).max(1.0);
     let mut sheet_outputs = Vec::with_capacity(sheets.len());
     let mut total_waste = 0.0f64;
@@ -758,6 +891,39 @@ fn materialize_layout(
     }
 }
 
+fn run_tournament(
+    parts: &[PartSpec], cfg: &SheetConfig, active_idxs: Option<&[usize]>,
+    base_sheets: Option<&[SpatialSheet]>, strategies: &[Strategy], two_sided_first: bool,
+    strict_two_sided: bool,
+) -> Vec<SpatialSheet> {
+    strategies
+        .par_iter()
+        .enumerate()
+        .map(|(s_idx, st)| {
+            let order = match active_idxs {
+                Some(idxs) => build_order_subset(parts, idxs, st.order, cfg.sheet_in_sheet, two_sided_first && st.two_sided_first, None),
+                None => build_order(parts, st.order, cfg.sheet_in_sheet, two_sided_first && st.two_sided_first, None),
+            };
+            let init = base_sheets.map_or_else(|| Vec::with_capacity(8), |bs| bs.to_vec());
+            Some((s_idx, pack_order_onto(parts, cfg, &order, st.rule, st.best_fit_all, None, init).unwrap_or_default()))
+        })
+        .reduce(
+            || None,
+            |acc, item| match (acc, item) {
+                (None, x) | (x, None) => x,
+                (Some((ia, sa)), Some((ib, sb))) => {
+                    if solution_score(&sa, strict_two_sided).cmp(&solution_score(&sb, strict_two_sided)).then_with(|| ia.cmp(&ib)) != std::cmp::Ordering::Greater {
+                        Some((ia, sa))
+                    } else {
+                        Some((ib, sb))
+                    }
+                }
+            },
+        )
+        .map(|(_, s)| s)
+        .unwrap_or_default()
+}
+
 pub fn optimize_material_layout<F>(material_state: &MaterialStateInput, mut on_progress: F) -> LayoutOutput
 where
     F: FnMut(&str, f64, usize, usize, &LayoutOutput),
@@ -773,8 +939,9 @@ where
     let small_clr = raw_cfg.small_part_clearance.unwrap_or(0.0).max(0.0);
     let merge_cut = raw_cfg.merge_cut_paths.unwrap_or(false);
     let edge_zone = raw_cfg.small_part_edge_zone.unwrap_or(if merge_cut { 200.0 } else { 0.0 }).max(0.0);
-    let compact_dirs = raw_cfg.compact_directions.unwrap_or_else(|| vec!["left".to_string(), "bottom".to_string()]);
+    let compact_dirs = raw_cfg.compact_directions.clone().unwrap_or_else(|| vec!["left".to_string(), "bottom".to_string()]);
     let target_util = raw_cfg.target_sheet_utilization.unwrap_or(90.0);
+    let nest_by_room = raw_cfg.nest_by_room.unwrap_or(true);
 
     let cfg = SheetConfig {
         board_w, board_h, margin,
@@ -790,7 +957,9 @@ where
     }
 
     let (parts, has_rooms) = prepare_parts(material_state, &cfg, global_rot_div);
-    let ts = parts.iter().any(|p| p.two_sided);
+    let (two_sided_idxs, one_sided_idxs): (Vec<usize>, Vec<usize>) = (0..parts.len()).partition(|&i| parts[i].two_sided);
+    let ts = !two_sided_idxs.is_empty();
+    let strict_two_sided = ts && !nest_by_room;
 
     let mut strategies = vec![
         Strategy { order: SortOrder::MaxSideDesc, rule: BinRule::Bssf, best_fit_all: true, two_sided_first: ts },
@@ -813,31 +982,19 @@ where
         strategies.push(Strategy { order: SortOrder::RoomGrouped, rule: BinRule::Bssf, best_fit_all: true, two_sided_first: ts });
     }
 
-    let mut best_sheets = strategies
-        .par_iter()
-        .enumerate()
-        .map(|(s_idx, st)| {
-            let order = build_order(&parts, st.order, cfg.sheet_in_sheet, st.two_sided_first, None);
-            Some((s_idx, pack_order(&parts, &cfg, &order, st.rule, st.best_fit_all, None).unwrap_or_default()))
-        })
-        .reduce(
-            || None,
-            |acc, item| match (acc, item) {
-                (None, x) | (x, None) => x,
-                (Some((ia, sa)), Some((ib, sb))) => {
-                    if solution_score(&sa).cmp(&solution_score(&sb)).then_with(|| ia.cmp(&ib)) != std::cmp::Ordering::Greater {
-                        Some((ia, sa))
-                    } else {
-                        Some((ib, sb))
-                    }
-                }
-            },
-        )
-        .map(|(_, s)| s)
-        .unwrap_or_default();
-
     let seed = material_state.optimization_seed.or(raw_cfg.optimization_seed).unwrap_or(42);
-    best_sheets = squeeze_sheets(&parts, &cfg, best_sheets, seed);
+    let best_sheets = if strict_two_sided && !one_sided_idxs.is_empty() {
+        // Phase A: Consolidate all 2-sided parts onto the minimum number of leading sheets first
+        let best_2s = run_tournament(&parts, &cfg, Some(&two_sided_idxs), None, &strategies, false, false);
+        let best_2s = squeeze_sheets_opts(&parts, &cfg, best_2s, seed, Some(&two_sided_idxs), None, false, false);
+        // Phase B: Backfill remaining free space on those leading sheets and pack 1-sided parts
+        let best_sheets = run_tournament(&parts, &cfg, Some(&one_sided_idxs), Some(&best_2s), &strategies, false, true);
+        // Phase C: Squeeze total sheet count without spilling 2-sided parts onto later sheets
+        squeeze_sheets_opts(&parts, &cfg, best_sheets, seed, Some(&one_sided_idxs), Some(&best_2s), true, true)
+    } else {
+        let best_sheets = run_tournament(&parts, &cfg, None, None, &strategies, ts, false);
+        squeeze_sheets_opts(&parts, &cfg, best_sheets, seed, None, None, ts, false)
+    };
     let layout = materialize_layout(material_state, &cfg, &parts, best_sheets, compact_dirs, target_util, global_rot_div);
     on_progress("Done", 100.0, 1, 1, &layout);
     layout
@@ -1088,5 +1245,238 @@ mod tests {
         let layout = materialize_layout(&mat, &cfg, &specs, sheets, vec!["left".to_string()], 90.0, 1);
         assert!(layout.safety_certified);
         assert_eq!(layout.sheets.len(), 2);
+    }
+
+    fn make_rect_part(id: &str, w: f64, h: f64, two_sided: bool) -> PartInput {
+        let mut p = make_part(id, vec![[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]], None);
+        p.width = Some(w);
+        p.height = Some(h);
+        p.area = Some(w * h);
+        p.two_sided = Some(two_sided);
+        p
+    }
+
+    #[test]
+    fn test_f_two_sided_grouped_leading_sheets_small_job() {
+        let mut parts = Vec::new();
+        // 3 two-sided parts fitting easily on 1 sheet (~0.62 sheet area)
+        parts.push(make_rect_part("ts_1", 550.0, 1200.0, true));
+        parts.push(make_rect_part("ts_2", 350.0, 1400.0, true));
+        parts.push(make_rect_part("ts_3", 250.0, 1100.0, true));
+        // 30 varied one-sided parts (~4-5 sheets)
+        for i in 0..30 {
+            let (w, h) = match i % 5 {
+                0 => (560.0, 1800.0),
+                1 => (450.0, 1100.0),
+                2 => (380.0, 900.0),
+                3 => (280.0, 750.0),
+                _ => (180.0, 620.0),
+            };
+            parts.push(make_rect_part(&format!("os_{}", i), w, h, false));
+        }
+
+        let mat = MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(ConfigurationInput {
+                board_width: Some(1220.0),
+                board_height: Some(2440.0),
+                edge_margin: Some(3.0),
+                part_spacing: Some(5.0),
+                sheet_in_sheet: Some(false),
+                rotation_divisions: Some(1),
+                nest_by_room: Some(false),
+                ..Default::default()
+            }),
+            original_part_count: Some(parts.len()),
+            parts,
+            learning_key: None,
+            optimization_seed: Some(42),
+        };
+
+        let layout = optimize_material_layout(&mat, |_, _, _, _, _| {});
+        assert!(layout.safety_certified);
+        let total_placed: usize = layout.sheets.iter().map(|s| s.placements.len()).sum();
+        assert_eq!(total_placed, 33);
+
+        let ts_sheet_indices: Vec<usize> = layout.sheets.iter().enumerate()
+            .filter(|(_, s)| s.placements.iter().any(|p| p.two_sided == Some(true)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ts_sheet_indices, vec![0], "All 3 two-sided parts must be grouped strictly onto Sheet 1");
+        assert_eq!(
+            layout.sheets[0].placements.iter().filter(|p| p.two_sided == Some(true)).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_g_two_sided_grouped_leading_sheets_large_job() {
+        let mut parts = Vec::new();
+        // 11 two-sided parts (~1.42 sheets -> must consolidate onto <= 2 leading sheets)
+        for i in 0..11 {
+            let (w, h) = if i < 3 { (560.0, 1100.0) } else if i < 7 { (420.0, 950.0) } else { (320.0, 820.0) };
+            parts.push(make_rect_part(&format!("ts_{}", i), w, h, true));
+        }
+        // 90 one-sided parts (~13-15 sheets)
+        for i in 0..90 {
+            let (w, h) = match i % 6 {
+                0 => (580.0, 2100.0),
+                1 => (500.0, 1600.0),
+                2 => (420.0, 1200.0),
+                3 => (350.0, 850.0),
+                4 => (240.0, 700.0),
+                _ => (150.0, 550.0),
+            };
+            parts.push(make_rect_part(&format!("os_{}", i), w, h, false));
+        }
+
+        let mat = MaterialStateInput {
+            key: None,
+            material: Some("A150G".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(ConfigurationInput {
+                board_width: Some(1220.0),
+                board_height: Some(2440.0),
+                edge_margin: Some(3.0),
+                part_spacing: Some(5.0),
+                sheet_in_sheet: Some(false),
+                rotation_divisions: Some(1),
+                nest_by_room: Some(false),
+                ..Default::default()
+            }),
+            original_part_count: Some(parts.len()),
+            parts,
+            learning_key: None,
+            optimization_seed: Some(42),
+        };
+
+        let layout = optimize_material_layout(&mat, |_, _, _, _, _| {});
+        assert!(layout.safety_certified);
+        let total_placed: usize = layout.sheets.iter().map(|s| s.placements.len()).sum();
+        assert_eq!(total_placed, 101);
+
+        let ts_sheet_indices: Vec<usize> = layout.sheets.iter().enumerate()
+            .filter(|(_, s)| s.placements.iter().any(|p| p.two_sided == Some(true)))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!ts_sheet_indices.is_empty() && ts_sheet_indices.len() <= 2, "Expected <=2 leading 2-sided sheets, got {:?}", ts_sheet_indices);
+        let expected_leading: Vec<usize> = (0..ts_sheet_indices.len()).collect();
+        assert_eq!(ts_sheet_indices, expected_leading, "2-sided sheets must be strictly contiguous at the front");
+    }
+
+    fn build_mixed_two_sided_and_holed_parts() -> Vec<PartInput> {
+        let mut parts = Vec::with_capacity(72);
+        // 12 two-sided parts (~1.40 sheets of 1200x2420 usable area = 2,904,000)
+        for i in 0..12 {
+            let (w, h) = if i < 4 {
+                (560.0, 1000.0)
+            } else if i < 8 {
+                (420.0, 700.0)
+            } else {
+                (300.0, 540.0)
+            };
+            parts.push(make_rect_part(&format!("ts_{}", i), w, h, true));
+        }
+        // 60 varied 1-sided parts including large panels & holed frames
+        for i in 0..60 {
+            match i % 6 {
+                0 => {
+                    let mut frame = make_part(
+                        &format!("os_frame_{}", i),
+                        vec![[0.0, 0.0], [900.0, 0.0], [900.0, 1200.0], [0.0, 1200.0]],
+                        Some(vec![vec![[120.0, 120.0], [780.0, 120.0], [780.0, 1080.0], [120.0, 1080.0]]]),
+                    );
+                    frame.width = Some(900.0);
+                    frame.height = Some(1200.0);
+                    frame.two_sided = Some(false);
+                    parts.push(frame);
+                }
+                1 => parts.push(make_rect_part(&format!("os_{}", i), 580.0, 2000.0, false)),
+                2 => parts.push(make_rect_part(&format!("os_{}", i), 500.0, 1400.0, false)),
+                3 => parts.push(make_rect_part(&format!("os_{}", i), 400.0, 800.0, false)),
+                4 => parts.push(make_rect_part(&format!("os_{}", i), 300.0, 600.0, false)),
+                _ => parts.push(make_rect_part(&format!("os_{}", i), 200.0, 400.0, false)),
+            }
+        }
+        parts
+    }
+
+    #[test]
+    fn test_strict_two_sided_consolidates_when_nest_by_room_false() {
+        let parts = build_mixed_two_sided_and_holed_parts();
+        let mat = MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(ConfigurationInput {
+                board_width: Some(1220.0),
+                board_height: Some(2440.0),
+                edge_margin: Some(10.0),
+                part_spacing: Some(5.0),
+                sheet_in_sheet: Some(true),
+                rotation_divisions: Some(1),
+                nest_by_room: Some(false),
+                ..Default::default()
+            }),
+            original_part_count: Some(parts.len()),
+            parts,
+            learning_key: None,
+            optimization_seed: Some(42),
+        };
+
+        let layout = optimize_material_layout(&mat, |_, _, _, _, _| {});
+        assert!(layout.safety_certified);
+        let total_placed: usize = layout.sheets.iter().map(|s| s.placements.len()).sum();
+        assert_eq!(total_placed, 72);
+
+        let ts_sheet_indices: Vec<usize> = layout.sheets.iter()
+            .filter(|s| s.placements.iter().any(|p| p.two_sided == Some(true)))
+            .map(|s| s.index)
+            .collect();
+        assert!(
+            !ts_sheet_indices.is_empty() && ts_sheet_indices.len() <= 2,
+            "Expected <= 2 two-sided sheets, got {:?}",
+            ts_sheet_indices
+        );
+        let expected_leading: Vec<usize> = (1..=ts_sheet_indices.len()).collect();
+        assert_eq!(
+            ts_sheet_indices, expected_leading,
+            "Two-sided placements must occupy leading sheets 1..=K with zero on later sheets"
+        );
+    }
+
+    #[test]
+    fn test_nest_by_room_true_keeps_valid_layout() {
+        let parts = build_mixed_two_sided_and_holed_parts();
+        let mat = MaterialStateInput {
+            key: None,
+            material: Some("MDF".to_string()),
+            thickness: Some(17.5),
+            group_index: None,
+            configuration: Some(ConfigurationInput {
+                board_width: Some(1220.0),
+                board_height: Some(2440.0),
+                edge_margin: Some(10.0),
+                part_spacing: Some(5.0),
+                sheet_in_sheet: Some(true),
+                rotation_divisions: Some(1),
+                nest_by_room: Some(true),
+                ..Default::default()
+            }),
+            original_part_count: Some(parts.len()),
+            parts,
+            learning_key: None,
+            optimization_seed: Some(42),
+        };
+
+        let layout = optimize_material_layout(&mat, |_, _, _, _, _| {});
+        assert!(layout.safety_certified);
+        let total_placed: usize = layout.sheets.iter().map(|s| s.placements.len()).sum();
+        assert_eq!(total_placed, 72);
     }
 }
